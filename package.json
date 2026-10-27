@@ -78,7 +78,8 @@
     "apps:preview": "npm run start:http --prefix mcp-apps",
     "apps:typecheck": "npm run typecheck --prefix mcp-apps",
     "apps:start:stdio": "npm run start:stdio --prefix mcp-apps",
-    "apps:start:http": "npm run start:http --prefix mcp-apps"
+    "apps:start:http": "npm run start:http --prefix mcp-apps",
+    "test:kc": "npm run build:server && node tests/kc/kc-lane.test.mjs && node tests/kc/kc-public-pin.test.mjs"
   },
   "keywords": [
     "mcp",
