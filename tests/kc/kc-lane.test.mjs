@@ -41,6 +41,7 @@ const lane = await import('../../dist/kc/lane.js');
 const { WorkflowBuilderClient: C } = await import('../../dist/clients/workflow-builder-client.js');
 const { WorkflowBuilderTools } = await import('../../dist/tools/workflow-builder-tools.js');
 const base = { apiKey: 'pit', firebaseApiKey: 'web-key', firebaseRefreshToken: 'TEST_REFRESH', userId: 'u' };
+const base0 = () => ({ ...base });
 const client = () => new C({ ...base, locationId: B });
 const cacheFile = () => join(cacheDir, readdirSync(cacheDir).find((x) => x.endsWith('.json') && !x.startsWith('audit')));
 const fakeClock = async (fn) => {
@@ -214,6 +215,36 @@ await test('two lane processes starting together on one login refresh exactly on
   const results = await Promise.all([run(), run()]);
   assert.deepEqual(results.map((r) => r[1]), ['done', 'done'], JSON.stringify(results));
   assert.equal(readFileSync(counter, 'utf8').length, 1, 'exactly one Firebase refresh across both processes');
+});
+
+await test('F3: a rejected token is skipped by every client in the process (agency per-location clients recover)', async () => {
+  const old = jwtAt(Math.floor(Date.now() / 1000) - 600); seedCache(old);
+  workflowStatus = 401;
+  try { await assert.rejects(() => client().listWorkflows({ limit: 1 }), /401/); } finally { workflowStatus = 200; }
+  const before = firebaseCalls;
+  await client().listWorkflows({ limit: 1 });        // a different client instance (next tool call)
+  assert.equal(firebaseCalls, before + 1, 'refreshed instead of repeating the 401');
+});
+await test('F3: forLocation reuses one client per sub-account', async () => {
+  const saved = process.env.KC_GHL_PINNED_LOCATION; delete process.env.KC_GHL_PINNED_LOCATION;
+  try {
+    const base = new C({ ...base0(), locationId: B });
+    assert.equal(base.forLocation(A), base.forLocation(A));
+    assert.equal(base.forLocation(B), base);
+  } finally { process.env.KC_GHL_PINNED_LOCATION = saved; }
+});
+await test('F4: a write whose response body stalls after the headers reports an unknown outcome', async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts = {}) => {
+    if (String(url).includes('securetoken')) return realFetch(url, opts);
+    if (opts.method === 'DELETE') {
+      const body = new ReadableStream({ start(c) { setTimeout(() => c.error(new DOMException('aborted', 'AbortError')), 10); } });
+      return new Response(body, { status: 200 });
+    }
+    return realFetch(url, opts);
+  };
+  try { await assert.rejects(() => client().deleteWorkflow('w1'), /was sent but did not finish.*may or may not have applied/s); }
+  finally { globalThis.fetch = realFetch; }
 });
 
 // ── Per-call deadline and cancellation (whole tool call, not one request)

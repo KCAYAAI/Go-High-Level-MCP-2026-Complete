@@ -22,6 +22,14 @@ import {
 import { kcPlanRequests, KcPartialWriteError, kcLaneMode, kcTargetLocation } from '../kc/lane.js';
 
 /** Tool result for a multi-step write that created something and then failed: name it, never hide it. */
+/** Remove the KC-added locationId argument (used outside KC lanes to keep upstream schemas). */
+function kcStripLocationArg(tool: Tool): Tool {
+  const schema = tool.inputSchema as { properties?: Record<string, unknown> };
+  if (!schema?.properties || !('locationId' in schema.properties)) return tool;
+  const { locationId: _drop, ...properties } = schema.properties;
+  return { ...tool, inputSchema: { ...tool.inputSchema, properties } as Tool['inputSchema'] };
+}
+
 function kcPartialResult(err: KcPartialWriteError, c: WorkflowBuilderClient): ToolResult {
   return {
     content: [{
@@ -85,7 +93,7 @@ export class WorkflowBuilderTools {
    * Returns MCP tool definitions for the 7 workflow builder tools.
    */
   getTools(): Tool[] {
-    return [
+    const tools: Tool[] = [
       // ─── CREATE ─────────────────────────────────────────
       {
         name: 'ghl_create_workflow',
@@ -337,6 +345,8 @@ export class WorkflowBuilderTools {
         _meta: { labels: { category: 'workflows', access: 'write', complexity: 'complex' } },
       } as Tool,
     ];
+    // KC lanes add an optional per-call sub-account; outside a lane the upstream schemas are unchanged.
+    return kcLaneMode() ? tools : tools.map(kcStripLocationArg);
   }
 
   /**
@@ -351,7 +361,7 @@ export class WorkflowBuilderTools {
     }
 
     try {
-      const loc = params.locationId ?? kcTargetLocation();
+      const loc = kcLaneMode() ? (params.locationId ?? kcTargetLocation()) : undefined;
       const c = loc === undefined || loc === '' ? this.client : this.client.forLocation(loc as string);
       switch (name) {
         case 'ghl_create_workflow':

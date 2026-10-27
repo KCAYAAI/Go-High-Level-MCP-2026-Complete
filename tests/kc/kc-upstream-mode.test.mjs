@@ -45,6 +45,12 @@ await t('clone failure surfaces the original error, not a KC partial-write wrapp
   failPut = true;
   try { await assert.rejects(() => new C(cfg).cloneWorkflow('src'), (e) => e.name !== 'KcPartialWriteError' && !/KC lane/.test(e.message)); } finally { failPut = false; }
 });
+await t('workflow tool schemas carry no KC locationId outside a lane', async () => {
+  const { WorkflowBuilderTools } = await import('../../dist/tools/workflow-builder-tools.js');
+  const tools = new WorkflowBuilderTools().getTools();
+  assert.equal(tools.length, 7);
+  assert.ok(tools.every((x) => !('locationId' in (x.inputSchema.properties || {}))));
+});
 await t('no KC audit file is written', () => assert.equal(existsSync(process.env.KC_GHL_AUDIT_LOG), false));
 
 for (const r of results) console.log(r.join(' | '));

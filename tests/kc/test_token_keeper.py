@@ -20,6 +20,9 @@ class Firebase(http.server.BaseHTTPRequestHandler):
         body = urllib.parse.parse_qs(self.rfile.read(int(self.headers['Content-Length'])).decode())
         rt = body['refresh_token'][0]
         Firebase.CALLS.append(rt)
+        if Firebase.MODE == 'garbage':
+            data = b'<html>not json</html>'
+            self.send_response(200); self.send_header('Content-Length', str(len(data))); self.end_headers(); self.wfile.write(data); return
         if Firebase.MODE == '429':
             return self._send(429, {'error': {'message': 'QUOTA_EXCEEDED'}})
         if rt in Firebase.DEAD:
@@ -114,7 +117,7 @@ class KeeperTest(unittest.TestCase):
     def test_all_dead_reports_dead_and_alerts_once(self):
         self.k.vault_set('T_RT', 'X'); Firebase.DEAD = {'X'}
         posted = []
-        self.k.slack = lambda text: posted.append(text)
+        self.k.slack = lambda text: (posted.append(text), True)[1]
         self.assertEqual(self.run_keeper(), 1)
         self.assertEqual(self.status()['state'], 'dead')
         self.run_keeper()
@@ -126,7 +129,7 @@ class KeeperTest(unittest.TestCase):
 
     def test_quota_is_transient_and_alerts_after_three_runs(self):
         self.k.vault_set('T_RT', 'OK1'); Firebase.MODE = '429'
-        posted = []; self.k.slack = lambda text: posted.append(text)
+        posted = []; self.k.slack = lambda text: (posted.append(text), True)[1]
         for _ in range(2):
             self.assertEqual(self.run_keeper(), 1)
         self.assertEqual((self.status()['state'], len(posted)), ('retrying', 0))
@@ -151,6 +154,38 @@ class KeeperTest(unittest.TestCase):
         self.assertEqual(self.run_keeper(), 0)
         self.assertEqual(self.k.vault_get('T_RT'), 'NEW')
         self.assertEqual(self.files('.refresh-pending'), [])
+
+    def _two_logins(self):
+        reg = json.load(open(os.environ['KC_GHL_REGISTRY']))
+        reg['lanes']['lane_b'] = {'credential_owner': 'other', 'secrets': {'GHL_FIREBASE_REFRESH_TOKEN': 'T_RT2', 'GHL_FIREBASE_API_KEY': 'T_KEY'}}
+        json.dump(reg, open(os.environ['KC_GHL_REGISTRY'], 'w'))
+        self.k.vault_set('T_RT2', 'SECOND')
+
+    def test_vault_timeout_fails_one_login_and_the_run_continues(self):
+        self._two_logins(); self.k.vault_set('T_RT', 'S')
+        real = self.k.vault_get
+        def slow(key):
+            if key == 'T_RT':
+                raise self.k.Transient('vault read timed out or failed (TimeoutExpired)')
+            return real(key)
+        self.k.vault_get = slow
+        self.assertEqual(self.run_keeper(), 1)
+        st = json.load(open(os.path.join(self.cache, 'keeper-status.json')))
+        self.assertEqual(st['owner:T_RT']['state'], 'retrying')
+        self.assertEqual(st['other:T_RT2']['state'], 'ok', 'second login still processed')
+
+    def test_non_json_firebase_response_is_transient(self):
+        self.k.vault_set('T_RT', 'S'); Firebase.MODE = 'garbage'
+        self.assertEqual(self.run_keeper(), 1)
+        self.assertIn('non-JSON', self.status()['last_error'])
+
+    def test_failed_alert_is_retried_and_success_marks_it(self):
+        self.k.vault_set('T_RT', 'X'); Firebase.DEAD = {'X'}
+        attempts = []
+        self.k.slack = lambda text: (attempts.append(text), len(attempts) >= 2)[1]   # first post fails, second succeeds
+        self.run_keeper(); self.assertFalse(self.status().get('alerted'))
+        self.run_keeper(); self.assertTrue(self.status().get('alerted'))
+        self.run_keeper(); self.assertEqual(len(attempts), 2, 'no repeat after a delivered alert')
 
     def _cid(self):
         cache = [f for f in self.files('.json') if not f.endswith('keeper-status.json')][0]

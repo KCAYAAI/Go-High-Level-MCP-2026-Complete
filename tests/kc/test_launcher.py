@@ -80,6 +80,22 @@ class LauncherTest(unittest.TestCase):
         self.assert_clean_fail(GOOD, 'not approved', '--lane', 'loc_lane', '--caller', 'brand', '--check')
         self.assert_clean_fail(GOOD, 'unknown lane', '--lane', 'nope', '--caller', 'scout', '--check')
 
+    def test_lane_env_cannot_override_launcher_variables(self):
+        for k in ('KC_GHL_PINNED_LOCATION', 'KC_GHL_LANE', 'GHL_API_KEY', 'GHL_LOCATION_ID', 'GHL_FIREBASE_REFRESH_TOKEN'):
+            self.assert_clean_fail(self.mutate(lambda r: r['lanes']['loc_lane'].__setitem__('env', {k: ''})), 'launcher-controlled')
+
+    def test_lane_env_may_extend_agency_paths(self):
+        reg = self.mutate(lambda r: r['lanes']['agency_lane'].__setitem__('env', {'GHL_USER_TYPE': '', 'KC_GHL_AGENCY_PATHS': '/x'}))
+        self.assertEqual(self.run_with(reg, '--lane', 'agency_lane', '--caller', 'roary', '--check').returncode, 0)
+
+    def test_common_env_reserved_or_non_string(self):
+        self.assert_clean_fail(self.mutate(lambda r: r['common_env'].__setitem__('KC_GHL_LANE', 'x')), 'launcher-controlled')
+        self.assert_clean_fail(self.mutate(lambda r: r['common_env'].__setitem__('GHL_API_VERSION', 3)), 'common_env')
+
+    def test_check_works_without_account_label(self):
+        r = self.run_with(self.mutate(lambda r: r['lanes']['loc_lane'].pop('account')), '--lane', 'loc_lane', '--caller', 'scout', '--check')
+        self.assertEqual(r.returncode, 0, r.stderr)
+
     def test_add_subaccount_rejects_bad_input_offline(self):
         self.assert_clean_fail(GOOD, 'location ID', '--add-subaccount', 'short', '--vault-key', 'SUB_X')
         self.assert_clean_fail(GOOD, 'pinned', '--add-subaccount', ID(9), '--vault-key', 'SUB_X', '--lane', 'loc_lane')

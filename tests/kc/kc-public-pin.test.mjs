@@ -134,6 +134,14 @@ await t('a public write cut off in flight reports an unknown outcome', async () 
     await assert.rejects(lane.kcRunToolCall('t', caller.signal, () => ax.post('/contacts/', { locationId: B })), /was sent but did not finish.*may or may not have applied/s);
   } finally { ax.defaults.adapter = adapter; }
 });
+await t('F5: bodies nested deeper than the guard inspects are refused (pinned lane)', async () => {
+  let deep = { locationId: A }; for (let i = 0; i < 20; i++) deep = { x: [deep] };
+  await blocked(ax.post('/contacts/', deep));
+});
+await t('F5: a JSON string body that is deep is refused, not swallowed', async () => {
+  let deep = { locationId: A }; for (let i = 0; i < 20; i++) deep = { x: deep };
+  await blocked(ax.post('/contacts/', JSON.stringify(deep)));
+});
 await t('agency lane (unpinned) allows any account', async () => {
   delete process.env.KC_GHL_PINNED_LOCATION; sent = [];
   try { await ax.get(`/locations/${A}`); assert.equal(sent.length, 1); } finally { process.env.KC_GHL_PINNED_LOCATION = B; }

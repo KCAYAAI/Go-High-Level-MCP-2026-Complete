@@ -80,6 +80,28 @@ await t('pinned lane: per-call locationId for another account is refused', async
   try { assert.throws(() => lane.kcSplitLocationArg({ locationId: A }, false), /KC lane guard/); assert.equal(lane.kcSplitLocationArg({ locationId: B }, false).location, B); }
   finally { delete process.env.KC_GHL_PINNED_LOCATION; }
 });
+await t('F1: a locationless request follows the sub-account the call selected, not the lane default', async () => {
+  await lane.kcRunToolCall('get_contact', undefined, () => ax.get('/contacts/abc123'), A);
+  assert.equal(auth(), 'Bearer tok-A');
+});
+await t('F1: a request naming a different sub-account than the call selected is refused, nothing sent', async () => {
+  await assert.rejects(lane.kcRunToolCall('t', undefined, () => ax.get('/contacts/', { params: { locationId: B } }), A), /different sub-account/);
+  assert.equal(sent.length, 0);
+});
+await t('F5: bodies nested deeper than the guard inspects are refused (agency lane)', async () => {
+  let deep = { locationId: A }; for (let i = 0; i < 20; i++) deep = { x: deep };
+  await assert.rejects(ax.post('/contacts/', deep), /nested too deeply/); assert.equal(sent.length, 0);
+});
+await t('F10: tool results with isError are audited as failures', async () => {
+  const { mkdtempSync, readFileSync } = await import('node:fs'); const { join } = await import('node:path'); const { tmpdir } = await import('node:os');
+  const f = join(mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'kc-audit-')), 'a.jsonl'); process.env.KC_GHL_AUDIT_LOG = f;
+  try {
+    await lane.kcRunToolCall('x', undefined, async () => ({ isError: true, content: [] }));
+    await lane.kcRunToolCall('y', undefined, async () => ({ content: [] }));
+    const rows = readFileSync(f, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    assert.deepEqual(rows.map((r) => [r.tool, r.ok]), [['x', false], ['y', true]]);
+  } finally { delete process.env.KC_GHL_AUDIT_LOG; }
+});
 await t('outside a KC lane nothing is routed', async () => {
   delete process.env.KC_GHL_LANE;
   try { await ax.get('/contacts/', { params: { locationId: A } }); assert.equal(auth(), 'Bearer tok-AGENCY'); } finally { process.env.KC_GHL_LANE = 'agency_test'; }

@@ -40,6 +40,17 @@ ID20 = re.compile(r'[A-Za-z0-9]{20}')
 KEYNAME = re.compile(r'[A-Z][A-Z0-9_]*')
 
 
+RESERVED_PREFIXES = ('KC_GHL_', 'GHL_FIREBASE_')
+RESERVED_NAMES = {'GHL_API_KEY', 'GHL_LOCATION_ID', 'GHL_USER_ID', 'GHL_COMPANY_ID', 'PATH', 'HOME'}
+ALLOWED_KC_OVERRIDES = {'KC_GHL_AGENCY_PATHS'}  # data, not identity: lanes may extend the agency path list
+
+
+def reserved(name):
+    if name in ALLOWED_KC_OVERRIDES:
+        return False
+    return name in RESERVED_NAMES or name.startswith(RESERVED_PREFIXES)
+
+
 def validate(reg):
     """Fail cleanly (exit 2, one line) on any malformed registry; never a traceback."""
     if not isinstance(reg, dict):
@@ -49,8 +60,11 @@ def validate(reg):
             fail(f'lane registry: {k} must be an absolute path')
     if not isinstance(reg.get('lanes'), dict) or not reg['lanes']:
         fail('lane registry: lanes must be a non-empty object')
-    if not isinstance(reg.get('common_env', {}), dict):
-        fail('lane registry: common_env must be an object')
+    ce = reg.get('common_env', {})
+    if not isinstance(ce, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in ce.items()):
+        fail('lane registry: common_env must map names to strings')
+    if any(reserved(k) for k in ce):
+        fail('lane registry: common_env may not set launcher-controlled variables')
     for name, lane in reg['lanes'].items():
         where = f'lane {name}'
         if not isinstance(lane, dict):
@@ -81,6 +95,9 @@ def validate(reg):
         env = lane.get('env', {})
         if not isinstance(env, dict) or not all(isinstance(k, str) and (v is None or isinstance(v, (str, int))) for k, v in env.items()):
             fail(f'{where}: env must map names to strings')
+        bad = sorted(k for k in env if reserved(k))
+        if bad:
+            fail(f"{where}: env may not set launcher-controlled variables ({', '.join(bad)})")
 
 
 def secret(name):
@@ -92,6 +109,17 @@ def secret(name):
     return value
 
 
+def ghl_get_conclusive(token, path):
+    """GET with retries for inconclusive answers (429, 5xx, network). Returns the final status."""
+    status = 0
+    for wait in (0, 3, 8, 15):
+        time.sleep(wait)
+        status, _ = ghl_get(token, path)
+        if status not in (0, 429) and status < 500:
+            return status
+    return status
+
+
 def ghl_get(token, path):
     req = urllib.request.Request(f'https://services.leadconnectorhq.com{path}', headers={
         'Authorization': f'Bearer {token}', 'Version': '2021-07-28', 'Accept': 'application/json',
@@ -101,6 +129,8 @@ def ghl_get(token, path):
             return r.status, json.loads(r.read() or b'{}')
     except urllib.error.HTTPError as e:
         return e.code, {}
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return 0, {}
 
 
 def add_subaccount(reg, lane_name, loc, key, replace=False):
@@ -120,15 +150,17 @@ def add_subaccount(reg, lane_name, loc, key, replace=False):
     if status != 200:
         fail(f'token in {key} cannot read location {loc} (HTTP {status})')
     # Must read this sub-account's own data (an agency token can read the record but not contacts) ...
-    s_own, _ = ghl_get(token, f'/contacts/?locationId={loc}&limit=1')
+    s_own = ghl_get_conclusive(token, f'/contacts/?locationId={loc}&limit=1')
     if s_own != 200:
         fail(f'token in {key} cannot read contacts in {loc} (HTTP {s_own}); expected that sub-account\'s own private integration')
     # ... and nothing in any other sub-account.
     others = [l for l in [lane.get('location_id')] + list((lane.get('location_tokens') or {}).keys()) if l and l != loc]
     for other in dict.fromkeys(others):
-        s2, _ = ghl_get(token, f'/contacts/?locationId={other}&limit=1')
+        s2 = ghl_get_conclusive(token, f'/contacts/?locationId={other}&limit=1')
         if s2 == 200:
             fail(f'token in {key} can also read sub-account {other}; expected a sub-account-scoped private integration')
+        if s2 not in (401, 403):
+            fail(f'could not confirm {key} is denied in sub-account {other} (HTTP {s2}); try again later')
     current = lane.get('location_tokens') or {}
     if current.get(loc) == key:
         print(f'already registered | {loc} ({name}) -> {key}')
@@ -171,7 +203,7 @@ def main():
     if a.list:
         for name, lane in lanes.items():
             state = 'PENDING' if lane.get('pending') else 'ready'
-            print(f"{name:20} {state:8} {lane.get('account', '')} | callers: {', '.join(lane.get('callers', []))}")
+            print(f"{name:20} {state:8} {lane.get('account', '')} | callers: {', '.join(lane.get('callers') or [])}")
         return
 
     if not a.lane or not a.caller:
@@ -186,6 +218,11 @@ def main():
 
     env = {k: os.environ[k] for k in ('PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR') if k in os.environ}
     env.update(reg.get('common_env', {}))
+    for k, v in (lane.get('env') or {}).items():  # validated: never a launcher-controlled name
+        if v is None or v == '':
+            env.pop(k, None)
+        else:
+            env[k] = str(v)
     env.update({
         'GHL_LOCATION_ID': lane['location_id'],
         'GHL_USER_ID': lane['user_id'],
@@ -206,11 +243,6 @@ def main():
     loc_tokens = lane.get('location_tokens') or {}
     if loc_tokens:
         env['KC_GHL_LOCATION_TOKENS'] = json.dumps({loc: secret(key) for loc, key in loc_tokens.items()})
-    for k, v in (lane.get('env') or {}).items():
-        if v is None or v == '':
-            env.pop(k, None)
-        else:
-            env[k] = str(v)
 
     node = shutil.which('node', path=env.get('PATH'))
     if not node:
@@ -219,7 +251,7 @@ def main():
         fail('BusyBee server build is missing')
 
     if a.check:
-        print(f"ok | lane {a.lane} | caller {a.caller} | account {lane['account']} | {len(lane['secrets'])} secrets loaded"
+        print(f"ok | lane {a.lane} | caller {a.caller} | account {lane.get('account', a.lane)} | {len(lane['secrets'])} secrets loaded"
               + (f" | {len(loc_tokens)} sub-account tokens" if loc_tokens else ''))
         return
     os.chdir(WORKDIR)

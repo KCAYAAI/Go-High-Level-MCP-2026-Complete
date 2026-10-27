@@ -9,7 +9,7 @@ Environment=HOME=/home/aya
 Environment=KC_GHL_REGISTRY=/home/aya/.local/share/kc-ghl/lanes.json
 Environment=KC_GHL_ALERT_CHANNEL=C0BL2LDCVPH
 WorkingDirectory=/home/aya/.local/share/kc-ghl
-ExecStart=/usr/bin/flock -n %t/kc-ghl-token-keeper.lock /home/aya/.local/share/kc-ghl/current/kc/bin/kc-ghl-token-keeper
+ExecStart=/home/aya/.local/share/kc-ghl/current/kc/bin/kc-ghl-token-keeper
 TimeoutStartSec=300
 NoNewPrivileges=true
 PrivateTmp=true

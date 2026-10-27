@@ -41,7 +41,8 @@ export async function kcRunToolCall<T>(tool: string, signal: AbortSignal | undef
   let ok = false;
   try {
     const out = await kcCall.run({ deadline: started + KC_CALL_BUDGET_MS, signal, tool, location }, fn);
-    ok = !(out && typeof out === 'object' && (out as { success?: unknown }).success === false);
+    const o = out as { success?: unknown; isError?: unknown } | undefined;
+    ok = !(o && typeof o === 'object' && (o.success === false || o.isError === true));
     return out;
   } finally {
     kcAudit(tool, ok, Date.now() - started);
@@ -263,19 +264,27 @@ function kcSegmentIsOtherAccount(seg: string, pin: string): boolean {
 }
 
 /** All primitive values under a location key (arrays, objects, nested). */
+const KC_MAX_INSPECT_DEPTH = 12;
+const kcTooDeep = (): never => { throw new Error('KC lane guard: request body is nested too deeply to inspect; refused'); };
+
 function kcCollectLeaves(v: unknown, out: unknown[], depth: number): void {
-  if (v === null || v === undefined || depth > 8) return;
+  if (v === null || v === undefined) return;
+  if (depth > KC_MAX_INSPECT_DEPTH) kcTooDeep();
   if (typeof v !== 'object') { out.push(v); return; }
   for (const x of Array.isArray(v) ? v : Object.values(v as Record<string, unknown>)) kcCollectLeaves(x, out, depth + 1);
 }
 
 /** Collect every location value named anywhere in a request body (any depth, any form). */
 function kcCollectBodyLocations(data: unknown, out: unknown[], depth = 0): void {
-  if (data === undefined || data === null || depth > 8) return;
+  if (data === undefined || data === null) return;
+  if (depth > KC_MAX_INSPECT_DEPTH) kcTooDeep();
   if (typeof data === 'string') {
     const s = data.trim();
     if (s.startsWith('{') || s.startsWith('[')) {
-      try { kcCollectBodyLocations(JSON.parse(s), out, depth + 1); } catch { /* not JSON */ }
+      let parsed: unknown;
+      let isJson = true;
+      try { parsed = JSON.parse(s); } catch { isJson = false; }
+      if (isJson) kcCollectBodyLocations(parsed, out, depth + 1); // outside the catch: inspection errors propagate
     } else if (s.includes('=')) {
       kcCollectBodyLocations(new URLSearchParams(s), out, depth + 1);
     }
@@ -380,7 +389,11 @@ export function kcAgencyTokenFor(rawUrl: string, fullUrl: string, data: unknown)
   kcCollectBodyLocations(data, named);
   const locs = new Set(named.filter((v) => v !== undefined && v !== null && v !== '').map(String));
   if (locs.size > 1) throw new Error('KC agency lane: this request names more than one sub-account; send one request per sub-account');
-  const loc = locs.size === 1 ? [...locs][0] : process.env.GHL_LOCATION_ID;
+  const target = kcTargetLocation();
+  if (target && locs.size === 1 && !locs.has(target)) {
+    throw new Error('KC agency lane: this request names a different sub-account than the one the tool call selected; refused');
+  }
+  const loc = locs.size === 1 ? [...locs][0] : (target ?? process.env.GHL_LOCATION_ID);
   if (!loc) return undefined;
   const tok = tokens.get(loc);
   if (!tok) {

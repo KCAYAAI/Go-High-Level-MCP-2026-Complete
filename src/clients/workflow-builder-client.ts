@@ -86,6 +86,9 @@ export interface WorkflowBuilderConfig {
 
 // ─── Client ─────────────────────────────────────────────────
 
+/** ID tokens GHL rejected (401) in this process; never reused from the shared cache. */
+const KC_REJECTED_TOKENS = new Set<string>();
+
 export class WorkflowBuilderClient {
   private config: WorkflowBuilderConfig;
   private cachedIdToken: string | null = null;
@@ -98,8 +101,8 @@ export class WorkflowBuilderClient {
   private static readonly TOKEN_TTL_MS = 55 * 60 * 1000; // 55 minutes (tokens last 60)
 
   private kcCacheFile: string | null = null;
-  /** ID token GHL rejected (401) in this process; never reused from the shared cache. */
-  private kcRejectedToken: string | null = null;
+  /** Per-location clients for the agency lane (one per sub-account, reused so auth state carries over). */
+  private kcLocationClients = new Map<string, WorkflowBuilderClient>();
 
   constructor(config: WorkflowBuilderConfig) {
     this.config = config;
@@ -122,7 +125,12 @@ export class WorkflowBuilderClient {
   forLocation(locationId: string): WorkflowBuilderClient {
     kcAssertLocationAllowed(locationId);
     if (locationId === this.config.locationId) return this;
-    return new WorkflowBuilderClient({ ...this.config, locationId });
+    let c = this.kcLocationClients.get(locationId);
+    if (!c) {
+      c = new WorkflowBuilderClient({ ...this.config, locationId });
+      this.kcLocationClients.set(locationId, c);
+    }
+    return c;
   }
 
   /**
@@ -312,7 +320,7 @@ export class WorkflowBuilderClient {
       try {
         const c = JSON.parse(readFileSync(cacheFile, 'utf8')) as { idToken?: unknown; expiresAt?: unknown };
         const exp = kcJwtExp(c.idToken);
-        if (c.idToken === this.kcRejectedToken) return false; // GHL rejected it: refresh under the lock instead
+        if (KC_REJECTED_TOKENS.has(c.idToken as string)) return false; // GHL rejected it: refresh under the lock instead
         if (exp !== null && c.expiresAt === exp && exp - Date.now() > margin) {
           this.cachedIdToken = c.idToken as string;
           this.tokenExpiry = exp - margin;
@@ -393,7 +401,7 @@ export class WorkflowBuilderClient {
       process.stderr.write('[KC GHL] 401 with a token minted under a minute ago; not refreshing (check the private integration token)\n');
       return;
     }
-    this.kcRejectedToken = rejected;
+    KC_REJECTED_TOKENS.add(rejected); // shared by every client in this process (all sub-accounts, same login)
     if (this.cachedIdToken === rejected) {
       this.cachedIdToken = null;
       this.tokenExpiry = 0;
@@ -494,7 +502,17 @@ export class WorkflowBuilderClient {
       throw err;
     }
     if (res.status === 401 && headers['token-id']) this.kcInvalidateToken(headers['token-id']);
-    const text = await res.text();
+    let text: string;
+    try {
+      text = await res.text();
+    } catch (err) {
+      // Headers arrived, then the body stalled or was aborted: for a write, GHL may have applied it.
+      const name = (err as Error)?.name;
+      if (kcIsWrite(method) && (name === 'AbortError' || name === 'TimeoutError')) {
+        throw kcUnknownOutcome(method, 'workflow request');
+      }
+      throw err;
+    }
 
     let data: T;
     try {

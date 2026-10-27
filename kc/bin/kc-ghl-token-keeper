@@ -56,12 +56,18 @@ class Dead(Exception):
 
 # ── vault ────────────────────────────────────────────────────
 def vault_get(key):
-    r = subprocess.run([SECRET_BIN, 'get', key], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20)
+    try:
+        r = subprocess.run([SECRET_BIN, 'get', key], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        raise Transient(f'vault read timed out or failed ({type(e).__name__})')
     return r.stdout.strip() if r.returncode == 0 else ''
 
 
 def vault_set(key, value):
-    r = subprocess.run([SECRET_BIN, 'set', key], input=value, capture_output=True, text=True, timeout=20)
+    try:
+        r = subprocess.run([SECRET_BIN, 'set', key], input=value, capture_output=True, text=True, timeout=20)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        raise RuntimeError(f'vault write timed out or failed for {key} ({type(e).__name__})')
     if r.returncode != 0:
         raise RuntimeError(f'vault write failed for {key}')
     if vault_get(key) != value:
@@ -147,7 +153,13 @@ def exchange_once(api_key, refresh_token):
                                  headers={'Content-Type': 'application/x-www-form-urlencoded'})
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
-            d = json.loads(r.read())
+            raw = r.read()
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            raise Transient('Firebase returned a non-JSON response')
+        if not isinstance(d, dict):
+            raise Transient('Firebase returned an unexpected response')
         return d.get('id_token', ''), d.get('refresh_token', '')
     except urllib.error.HTTPError as e:
         text = e.read().decode('utf-8', 'replace')[:400]
@@ -237,20 +249,27 @@ def logins_from_registry(reg):
 
 
 def slack(text):
+    """Post an alert. Returns True only when Slack confirms delivery (no channel configured counts as delivered)."""
     if not ALERT_CHANNEL:
-        return
-    token = vault_get('SCOUT_SLACK_BOT_TOKEN')
+        return True
+    try:
+        token = vault_get('SCOUT_SLACK_BOT_TOKEN')
+    except Transient:
+        return False
     if not token:
-        return
+        log('alert not sent: SCOUT_SLACK_BOT_TOKEN missing')
+        return False
     req = urllib.request.Request('https://slack.com/api/chat.postMessage',
                                  data=json.dumps({'channel': ALERT_CHANNEL, 'text': text}).encode(),
                                  headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json; charset=utf-8'})
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
-            ok = json.loads(r.read()).get('ok')
-        log(f'alert posted to Slack: {ok}')
+            ok = bool(json.loads(r.read()).get('ok'))
     except Exception as e:
         log(f'alert post failed: {type(e).__name__}')
+        return False
+    log(f'alert posted to Slack: {ok}')
+    return ok
 
 
 def main():
@@ -277,22 +296,22 @@ def main():
         s = status.setdefault(cred, {'failures': 0})
         try:
             result = keep_login(login, cache_dir, a.force)
-            if s.get('alerted'):
-                slack(f":white_check_mark: GHL login `{cred}` is healthy again (lanes: {', '.join(login['lanes'])}).")
-            s.update(state='ok', failures=0, last_ok=now(), last_error='', alerted=False)
+            s.update(state='ok', failures=0, last_ok=now(), last_error='')
+            if s.get('alerted') and slack(f":white_check_mark: GHL login `{cred}` is healthy again (lanes: {', '.join(login['lanes'])})."):
+                s['alerted'] = False  # recovery notice delivered; otherwise retried next run
             if 'rotated' in result:
                 s['last_rotation'] = now()
             log(f'{cred} | {result}')
-        except (Dead, Transient, RuntimeError, OSError) as e:
+        except Exception as e:  # one login's failure never stops the others or the status write
             failed += 1
             dead = isinstance(e, Dead)
             s.update(state='dead' if dead else 'retrying', failures=s.get('failures', 0) + 1,
                      last_error=f'{type(e).__name__}: {e}', last_failure=now())
             log(f'{cred} | FAILED ({s["failures"]}) | {s["last_error"]}')
             if not s.get('alerted') and (dead or s['failures'] >= ALERT_AFTER_FAILURES):
-                slack(f":rotating_light: GHL login `{cred}` {'is dead and needs a new login' if dead else 'keeps failing to refresh'}"
-                      f" — {e}. Lanes affected: {', '.join(login['lanes'])}. Check: `kc-ghl-token-keeper --status`.")
-                s['alerted'] = True
+                if slack(f":rotating_light: GHL login `{cred}` {'is dead and needs a new login' if dead else 'keeps failing to refresh'}"
+                         f" — {e}. Lanes affected: {', '.join(login['lanes'])}. Check: `kc-ghl-token-keeper --status`."):
+                    s['alerted'] = True  # only once delivered; a failed post is retried next run
     write_atomic(status_file, json.dumps(status, indent=2))
     return 1 if failed else 0
 
