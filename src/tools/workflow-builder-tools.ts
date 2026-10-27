@@ -349,6 +349,8 @@ export class WorkflowBuilderTools {
       } as Tool,
     ];
     // KC lanes add an optional per-call sub-account; outside a lane the upstream schemas are unchanged.
+    // A KC lane without a GHL login (no Firebase secrets, e.g. a read-only lane) exposes no workflow-builder tools.
+    if (kcLaneMode() && !this.client) return [];
     return kcLaneMode() ? tools : tools.map(kcStripLocationArg);
   }
 

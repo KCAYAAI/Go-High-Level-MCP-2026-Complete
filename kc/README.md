@@ -101,6 +101,15 @@ systemctl --user list-timers kc-ghl-token-keeper.timer
 journalctl --user -u kc-ghl-token-keeper -n 20    # recent runs
 ```
 
+### Read-only agency lane (scheduled jobs)
+
+`ghl_agency_readonly` is the lane KC-profile cron jobs use to read any sub-account. Every token is a sub-account private
+integration created with only `*.readonly` / `*.read` scopes, so GHL refuses writes. The lane has no Firebase secrets, so it
+exposes no workflow-builder tools, and its default token is a sub-account token, so agency-only endpoints are refused.
+Roary and Brand use `ghl_agency_admin` (full agency admin). KC jobs that write use the pinned `ghl_kc` / `ghl_kcnext` lanes.
+Everything is registry data: add a sub-account with
+`kc-ghl --lane ghl_agency_readonly --add-subaccount <locationId> --vault-key <KEY>` (no code change).
+
 Known limits (accepted): `--caller` is attribution, not authentication (all agents run as one OS user).
 ## Test
 

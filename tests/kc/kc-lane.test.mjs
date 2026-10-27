@@ -261,6 +261,13 @@ await test('R5: a write whose body fails with a connection reset after headers r
   finally { globalThis.fetch = realFetch; }
 });
 
+await test('a lane without Firebase secrets (read-only lane) lists no workflow-builder tools', async () => {
+  const saved = { k: process.env.GHL_FIREBASE_API_KEY, r: process.env.GHL_FIREBASE_REFRESH_TOKEN };
+  delete process.env.GHL_FIREBASE_API_KEY; delete process.env.GHL_FIREBASE_REFRESH_TOKEN;
+  try { assert.deepEqual(new WorkflowBuilderTools().getTools(), []); }
+  finally { if (saved.k !== undefined) process.env.GHL_FIREBASE_API_KEY = saved.k; if (saved.r !== undefined) process.env.GHL_FIREBASE_REFRESH_TOKEN = saved.r; }
+});
+
 // ── Per-call deadline and cancellation (whole tool call, not one request)
 await test('a write is not sent when too little call time remains; nothing changes', async () => {
   sent = [];
