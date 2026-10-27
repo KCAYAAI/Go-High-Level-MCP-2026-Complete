@@ -96,6 +96,11 @@ class LauncherTest(unittest.TestCase):
         r = self.run_with(self.mutate(lambda r: r['lanes']['loc_lane'].pop('account')), '--lane', 'loc_lane', '--caller', 'scout', '--check')
         self.assertEqual(r.returncode, 0, r.stderr)
 
+    def test_read_only_flag_validated(self):
+        self.assert_clean_fail(self.mutate(lambda r: r['lanes']['agency_lane'].__setitem__('read_only', 'yes')), 'read_only')
+        reg = self.mutate(lambda r: r['lanes']['agency_lane'].__setitem__('read_only', True))
+        self.assertEqual(self.run_with(reg, '--lane', 'agency_lane', '--caller', 'roary', '--check').returncode, 0)
+
     def test_add_subaccount_rejects_bad_input_offline(self):
         self.assert_clean_fail(GOOD, 'location ID', '--add-subaccount', 'short', '--vault-key', 'SUB_X')
         self.assert_clean_fail(GOOD, 'pinned', '--add-subaccount', ID(9), '--vault-key', 'SUB_X', '--lane', 'loc_lane')

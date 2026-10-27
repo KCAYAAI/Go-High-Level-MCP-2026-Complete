@@ -268,6 +268,34 @@ await test('a lane without Firebase secrets (read-only lane) lists no workflow-b
   finally { if (saved.k !== undefined) process.env.GHL_FIREBASE_API_KEY = saved.k; if (saved.r !== undefined) process.env.GHL_FIREBASE_REFRESH_TOKEN = saved.r; }
 });
 
+await test('R6: remembering a second rejected token keeps the first one rejected (expiry in ms)', async () => {
+  const t1 = jwtAt(Math.floor(Date.now() / 1000) - 600); seedCache(t1);
+  workflowStatus = 401;
+  try {
+    await assert.rejects(() => client().listWorkflows({ limit: 1 }), /401/);           // reject t1
+    const t2 = jwtAt(Math.floor(Date.now() / 1000) - 500); seedCache(t2);
+    await assert.rejects(() => client().listWorkflows({ limit: 1 }), /401/);           // reject t2 (prunes expired only)
+  } finally { workflowStatus = 200; }
+  seedCache(t1);                                                                        // stale t1 reappears in the cache
+  const before = firebaseCalls;
+  await client().listWorkflows({ limit: 1 });
+  assert.equal(firebaseCalls, before + 1, 't1 still known as rejected -> refreshed, not reused');
+});
+await test('R6: workflow-builder tool called by name in a login-less lane gets a clean refusal', async () => {
+  const saved = { k: process.env.GHL_FIREBASE_API_KEY, r: process.env.GHL_FIREBASE_REFRESH_TOKEN };
+  delete process.env.GHL_FIREBASE_API_KEY; delete process.env.GHL_FIREBASE_REFRESH_TOKEN;
+  try {
+    const res = await new WorkflowBuilderTools().executeWorkflowBuilderTool('ghl_create_workflow', { name: 'x' });
+    assert.equal(res.isError, true); assert.match(res.content[0].text, /no GHL login/);
+  } finally { if (saved.k !== undefined) process.env.GHL_FIREBASE_API_KEY = saved.k; if (saved.r !== undefined) process.env.GHL_FIREBASE_REFRESH_TOKEN = saved.r; }
+});
+await test('R6: read-only lane refuses workflow-builder writes before sending', async () => {
+  process.env.KC_GHL_READ_ONLY = '1'; sent = [];
+  try { await assert.rejects(() => client().deleteWorkflow('w1'), /read-only lane: DELETE refused/); }
+  finally { delete process.env.KC_GHL_READ_ONLY; }
+  assert.equal(sent.filter((x) => x.method === 'DELETE').length, 0);
+});
+
 // ── Per-call deadline and cancellation (whole tool call, not one request)
 await test('a write is not sent when too little call time remains; nothing changes', async () => {
   sent = [];

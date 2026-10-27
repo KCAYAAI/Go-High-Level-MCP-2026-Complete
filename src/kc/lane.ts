@@ -185,6 +185,8 @@ const KC_LOC_KEYS = new Set(['locationid', 'location_id', 'locationids', 'share_
 export const KC_MIN_CATALOG_TEMPLATES = 20;
 let kcLocPathTemplates: RegExp[] | null = null;
 let kcAgencyOnlyTemplates: RegExp[] = [];
+/** POST endpoints whose catalog scopes are all *.readonly / *.read (reads that use POST, e.g. searches). */
+let kcReadPostTemplates: RegExp[] = [];
 let kcCatalogPath = join(__dirname, '..', 'tools', 'official-spec-endpoints.json');
 
 /** Test hook: point the guard at a different catalog file and drop the cached templates. */
@@ -192,6 +194,7 @@ export function kcSetCatalogPathForTests(path: string): void {
   kcCatalogPath = path;
   kcLocPathTemplates = null;
   kcAgencyOnlyTemplates = [];
+  kcReadPostTemplates = [];
 }
 
 function kcTemplateRegex(path: string, captureLocation: boolean): RegExp {
@@ -219,9 +222,15 @@ function kcLocationPathTemplates(): RegExp[] {
   }
   if (!Array.isArray(spec)) throw new Error('KC lane guard: endpoint catalog malformed; public API calls are blocked in this lane');
   const agencyOnly: RegExp[] = [];
-  for (const e of spec as { path?: unknown; securitySchemes?: unknown }[]) {
+  const readPosts: RegExp[] = [];
+  for (const e of spec as { path?: unknown; securitySchemes?: unknown; method?: unknown; scopes?: unknown }[]) {
     const p = e?.path;
     if (typeof p !== 'string') continue;
+    const scopes = Array.isArray(e.scopes) ? (e.scopes as unknown[]) : [];
+    if (String(e.method).toUpperCase() === 'POST' && scopes.length > 0
+        && scopes.every((s) => typeof s === 'string' && /\.(readonly|read)$/.test(s))) {
+      readPosts.push(kcTemplateRegex(p, false));
+    }
     const schemes = Array.isArray(e.securitySchemes) ? (e.securitySchemes as string[]) : [];
     const agency = schemes.some((s) => s.startsWith('Agency-Access'));
     const location = schemes.some((s) => s.startsWith('Location-Access'));
@@ -229,6 +238,7 @@ function kcLocationPathTemplates(): RegExp[] {
     if (/\{(locationId|location_id)\}/.test(p)) out.push(kcTemplateRegex(p, true));
   }
   kcAgencyOnlyTemplates = agencyOnly;
+  kcReadPostTemplates = readPosts;
   if (out.length - 1 < KC_MIN_CATALOG_TEMPLATES) {
     throw new Error(`KC lane guard: endpoint catalog has only ${out.length - 1} location templates; public API calls are blocked in this lane`);
   }
@@ -315,6 +325,27 @@ function kcCollectBodyLocations(data: unknown, out: unknown[], depth = 0): void 
   if (typeof altType === 'string' && altType.toLowerCase() === 'location') {
     for (const [k, v] of Object.entries(r)) if (kcIsAltIdKey(k)) out.push(v);
   }
+}
+
+/** Search-style POST endpoints the hand-written tools use that are reads but are not in the official catalog. */
+const KC_READ_POST_FALLBACK = /^\/(contacts|objects\/[^/]+\/records|users|custom-fields)\/search\/?$/i;
+
+/**
+ * Read-only lanes (registry `read_only: true`, env KC_GHL_READ_ONLY=1): refuse every write before it leaves.
+ * Allowed: GET/HEAD/OPTIONS, and POSTs that are reads (catalog scopes all *.readonly / *.read, or a known search path).
+ * GHL's token scopes are the second line of defense.
+ */
+export function kcAssertReadOnly(method: string, fullUrl?: string): void {
+  if (!kcLaneMode() || process.env.KC_GHL_READ_ONLY !== '1') return;
+  const m = (method || 'get').toUpperCase();
+  if (!kcIsWrite(m)) return;
+  if (m === 'POST' && fullUrl) {
+    let path = '';
+    try { path = new URL(fullUrl).pathname; } catch { /* refused below */ }
+    kcLocationPathTemplates(); // loads the catalog-derived read POST list
+    if (path && (KC_READ_POST_FALLBACK.test(path) || kcReadPostTemplates.some((re) => re.test(path)))) return;
+  }
+  throw new Error(`KC read-only lane: ${m} refused before sending (this lane only reads; use a write lane for changes)`);
 }
 
 /** Every KC lane request: the final URL must be on the configured API host and have a safe path. */

@@ -123,6 +123,23 @@ await t('R5: lane mode without a base URL refuses instead of failing open', () =
   assert.throws(() => lane.kcAssertApiHost('https://x.example/a', 'https://x.example/a', undefined), /base URL unknown/);
   assert.throws(() => lane.kcAssertApiHost('/contacts/', 'https://x.example/contacts/', ''), /base URL unknown/);
 });
+await t('R6: read-only lane refuses writes before sending; reads and read-POSTs pass', async () => {
+  process.env.KC_GHL_READ_ONLY = '1';
+  try {
+    await assert.rejects(ax.put('/contacts/abc', {}, { params: { locationId: A } }), /read-only lane: PUT refused/);
+    await assert.rejects(ax.delete('/contacts/abc', { params: { locationId: A } }), /read-only lane: DELETE refused/);
+    await assert.rejects(ax.post('/contacts/', { locationId: A }), /read-only lane: POST refused/);
+    await assert.rejects(ax.post(`/contacts/abc/tags`, { tags: ['x'] }, { params: { locationId: A } }), /read-only lane: POST refused/);
+    assert.equal(sent.length, 0, 'no write left the process');
+    await ax.post('/contacts/search', { locationId: A, pageLimit: 1 });
+    await ax.post('/opportunities/search', { location_id: A });
+    await ax.get('/contacts/', { params: { locationId: A } });
+    assert.equal(sent.length, 3);
+  } finally { delete process.env.KC_GHL_READ_ONLY; }
+});
+await t('R6: without the read-only flag, writes are not refused by the lane', async () => {
+  await ax.put('/contacts/abc', {}, { params: { locationId: A } }); assert.equal(sent.length, 1);
+});
 await t('outside a KC lane nothing is routed', async () => {
   delete process.env.KC_GHL_LANE;
   try { await ax.get('/contacts/', { params: { locationId: A } }); assert.equal(auth(), 'Bearer tok-AGENCY'); } finally { process.env.KC_GHL_LANE = 'agency_test'; }

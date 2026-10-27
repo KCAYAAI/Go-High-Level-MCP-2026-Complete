@@ -128,7 +128,8 @@
       "env": {
         "GHL_USER_TYPE": ""
       },
-      "notes": "Read-only: every token is a sub-account private integration with only read scopes. No Firebase secrets, so no workflow-builder tools. Agency-only endpoints are refused by GHL (the default token is a sub-account token). Add sub-accounts with: kc-ghl --lane ghl_agency_readonly --add-subaccount <locationId> --vault-key <KEY>."
+      "notes": "Read-only: every token is a sub-account private integration with only read scopes. No Firebase secrets, so no workflow-builder tools. Agency-only endpoints are refused by GHL (the default token is a sub-account token). Add sub-accounts with: kc-ghl --lane ghl_agency_readonly --add-subaccount <locationId> --vault-key <KEY>.",
+      "read_only": true
     }
   }
 }

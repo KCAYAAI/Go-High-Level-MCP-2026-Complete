@@ -92,6 +92,8 @@ def validate(reg):
             fail(f'{where}: location_tokens must map 20-character location IDs to vault key names')
         if lt and lane.get('pinned', True):
             fail(f'{where}: location_tokens is only for unpinned (agency) lanes')
+        if not isinstance(lane.get('read_only', False), bool):
+            fail(f'{where}: read_only must be true or false')
         env = lane.get('env', {})
         if not isinstance(env, dict) or not all(isinstance(k, str) and (v is None or isinstance(v, (str, int))) for k, v in env.items()):
             fail(f'{where}: env must map names to strings')
@@ -242,6 +244,8 @@ def main():
     for env_name, vault_name in lane['secrets'].items():
         env[env_name] = secret(vault_name)
     # Agency lane: one private integration per sub-account ({locationId: vault key}).
+    if lane.get('read_only'):
+        env['KC_GHL_READ_ONLY'] = '1'
     loc_tokens = lane.get('location_tokens') or {}
     if loc_tokens:
         env['KC_GHL_LOCATION_TOKENS'] = json.dumps({loc: secret(key) for loc, key in loc_tokens.items()})

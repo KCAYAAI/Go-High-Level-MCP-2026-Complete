@@ -358,6 +358,9 @@ export class WorkflowBuilderTools {
    * Execute a workflow builder tool by name.
    */
   async executeWorkflowBuilderTool(name: string, params: Record<string, unknown>): Promise<ToolResult> {
+    if (!this.client && kcLaneMode()) {
+      return error('KC lane: this lane has no GHL login; workflow-builder tools are unavailable here.');
+    }
     if (!this.client) {
       return error(
         `Workflow builder not initialized: ${this.initError || 'Unknown error'}. ` +

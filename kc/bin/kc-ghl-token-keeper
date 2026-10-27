@@ -324,8 +324,8 @@ def main():
     if problem:
         log(f'registry invalid: {problem}')
         if not a.status and read_or_empty(marker) != problem:   # one alert per distinct problem
-            if slack(f':rotating_light: GHL token keeper cannot run: lane registry invalid ({problem}). Check `kc-ghl --list`.'):
-                write_atomic(marker, problem)
+            if slack(f':rotating_light: GHL token keeper cannot run: lane registry invalid ({problem}). Check `kc-ghl --list`.') and ALERT_CHANNEL:
+                write_atomic(marker, problem)   # only after a real post, so a later-configured channel still gets it
         return 2
     if not a.status:
         try:
@@ -366,11 +366,11 @@ def main():
             s.update(state='dead' if dead else 'retrying', failures=s.get('failures', 0) + 1,
                      last_error=f'{type(e).__name__}: {e}', last_failure=now())
             log(f'{cred} | FAILED ({s["failures"]}) | {s["last_error"]}')
-            s.pop('recovery_pending', None)              # a new failure supersedes an undelivered recovery notice
             if not s.get('alerted') and (dead or s['failures'] >= ALERT_AFTER_FAILURES):
                 if slack(f":rotating_light: GHL login `{cred}` {'is dead and needs a new login' if dead else 'keeps failing to refresh'}"
                          f" — {e}. Lanes affected: {', '.join(login['lanes'])}. Check: `kc-ghl-token-keeper --status`."):
                     s['alerted'] = True  # only once delivered; a failed post is retried next run
+                    s.pop('recovery_pending', None)  # the new incident alert supersedes the owed recovery notice
     write_atomic(status_file, json.dumps(status, indent=2))
     return 1 if failed else 0
 

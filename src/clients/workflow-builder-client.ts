@@ -15,7 +15,7 @@ import { resolve, join } from 'path';
 import {
   kcSleep, kcLaneMode, kcPinned, kcAssertId, kcAssertLocationAllowed, kcCheckCall, kcCheckWrite,
   kcRequestSignal, kcRemainingMs, kcTryLock, kcUnlock, kcLockName, kcJwtExp,
-  KC_AUTH_BUDGET_MS, kcCredentialName, kcStashRotatedRefreshToken, kcIsWrite, kcUnknownOutcome, kcJwtIat, KC_FRESH_TOKEN_MS,
+  KC_AUTH_BUDGET_MS, kcCredentialName, kcStashRotatedRefreshToken, kcIsWrite, kcUnknownOutcome, kcJwtIat, KC_FRESH_TOKEN_MS, kcAssertReadOnly,
   kcPlanRequests, KcPartialWriteError,
 } from '../kc/lane.js';
 
@@ -491,6 +491,7 @@ export class WorkflowBuilderClient {
     const headers = await this.getHeaders();
     // Re-check after auth: auth can take time, and a write must not start too late.
     kcCheckCall(`${method} request`);
+    kcAssertReadOnly(method);
     kcCheckWrite(method);
 
     const opts: RequestInit = { method, headers, signal: kcRequestSignal() };

@@ -237,6 +237,7 @@ class KeeperTest(unittest.TestCase):
     def test_null_lane_entry_is_a_registry_problem(self):
         reg = json.load(open(os.environ['KC_GHL_REGISTRY'])); reg['lanes']['broken'] = None
         json.dump(reg, open(os.environ['KC_GHL_REGISTRY'], 'w'))
+        self.k.ALERT_CHANNEL = 'C_TEST'
         alerts = []; self.k.slack = lambda text: (alerts.append(text), True)[1]
         self.assertEqual(self.run_keeper(), 2)
         self.assertEqual(self.run_keeper(), 2)
@@ -270,6 +271,27 @@ class KeeperTest(unittest.TestCase):
         self.assertEqual(self.run_keeper(), 0)            # no marker present: no error
         open(os.environ['KC_GHL_REGISTRY'] + '.keeper-alerted', 'w').write('old problem')
         self.assertEqual(self.run_keeper(), 0)
+        self.assertFalse(os.path.exists(os.environ['KC_GHL_REGISTRY'] + '.keeper-alerted'))
+
+    def test_owed_recovery_survives_a_failure_that_does_not_alert(self):
+        self.k.vault_set('T_RT', 'X'); Firebase.DEAD = {'X'}
+        posts = []; ok = {'v': True}
+        self.k.slack = lambda text: (posts.append(text), ok['v'])[1]
+        self.run_keeper()                                     # dead -> alert delivered
+        Firebase.DEAD = set(); ok['v'] = False
+        self.run_keeper('--force')                            # healthy, recovery post fails
+        Firebase.DEAD = set(); Firebase.MODE = '429'; ok['v'] = True
+        self.run_keeper('--force')                            # one transient failure, below the alert threshold
+        Firebase.MODE = 'ok'
+        self.run_keeper('--force')                            # healthy again -> owed recovery notice sent
+        self.assertEqual(sum('healthy again' in p for p in posts if p), 2, posts)   # failed attempt + delivered one
+        self.assertFalse(self.status().get('recovery_pending'))
+
+    def test_registry_marker_not_latched_without_a_channel(self):
+        reg = json.load(open(os.environ['KC_GHL_REGISTRY'])); reg['lanes']['broken'] = None
+        json.dump(reg, open(os.environ['KC_GHL_REGISTRY'], 'w'))
+        self.k.ALERT_CHANNEL = ''
+        self.assertEqual(self.run_keeper(), 2)
         self.assertFalse(os.path.exists(os.environ['KC_GHL_REGISTRY'] + '.keeper-alerted'))
 
     def _cid(self):
