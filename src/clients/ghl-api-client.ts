@@ -387,6 +387,41 @@ import { resolveVersion } from './version-router.js';
 import { resolveRequestVersion } from './endpoint-version-resolver.js';
 
 /**
+ * KC lane guard for the public API: inside a pinned lane, any location named in the
+ * URL path, query, or JSON body must be the lane's location. Omitted values default
+ * to the pinned location as before; an explicit different location is refused, not redirected.
+ */
+function kcAssertPublicLocation(config: AxiosRequestConfig): void {
+  const pinned = process.env.KC_GHL_PINNED_LOCATION;
+  if (!pinned) return;
+  const found: unknown[] = [];
+  const scan = (o: unknown) => {
+    if (!o || typeof o !== 'object' || Array.isArray(o)) return;
+    const r = o as Record<string, unknown>;
+    found.push(r.locationId, r.location_id);
+    if (typeof r.altType === 'string' && r.altType.toLowerCase() === 'location') found.push(r.altId);
+  };
+  scan(config.params);
+  let data: unknown = config.data;
+  if (typeof data === 'string') { try { data = JSON.parse(data); } catch { data = undefined; } }
+  scan(data);
+  const url = String(config.url || '');
+  const pathMatch = url.match(/\/locations\/([A-Za-z0-9]{20})(?=[/?#]|$)/);
+  if (pathMatch) found.push(pathMatch[1]);
+  const q = url.includes('?') ? new URLSearchParams(url.slice(url.indexOf('?') + 1)) : null;
+  if (q) {
+    found.push(q.get('locationId'), q.get('location_id'));
+    if ((q.get('altType') || '').toLowerCase() === 'location') found.push(q.get('altId'));
+  }
+  for (const v of found) {
+    if (v === undefined || v === null || v === '') continue;
+    if (String(v) !== pinned) {
+      throw new Error("KC lane guard: blocked a public API request for a location outside this lane's account");
+    }
+  }
+}
+
+/**
  * GoHighLevel API Client
  * Handles all API communication with GHL services
  */
@@ -418,6 +453,7 @@ export class GHLApiClient {
     // Add request interceptor for logging
     this.axiosInstance.interceptors.request.use(
       (config) => {
+        kcAssertPublicLocation(config);
         const requestFallback = typeof config.headers?.get === 'function'
           ? config.headers.get('Version')
           : config.headers?.Version;
