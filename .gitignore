@@ -52,3 +52,9 @@ pids/
 tmp/
 temp/ 
 .vercel
+
+# KC lanes: real registry and review packets hold account/user IDs; keep them local
+kc/lanes.json
+kc/lanes.*.json
+!kc/lanes.example.json
+kc/review/

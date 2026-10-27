@@ -1,0 +1,101 @@
+{
+  "server": "/home/aya/.local/share/kc-ghl/current/dist/server.js",
+  "audit_log": "/home/aya/.local/share/kc-ghl/audit/staging-calls.jsonl",
+  "token_cache_dir": "/home/aya/.local/share/kc-ghl/token-cache-staging",
+  "common_env": {
+    "GHL_BASE_URL": "https://services.leadconnectorhq.com",
+    "GHL_API_VERSION": "v3",
+    "GHL_API_GENERATION": "v3",
+    "GHL_USER_TYPE": "Location",
+    "GHL_TOOL_PROFILE": "full"
+  },
+  "lanes": {
+    "ghl_kc": {
+      "account": "KC Power Clean",
+      "location_id": "EXAMPLE0000000000001",
+      "credential_owner": "scout",
+      "user_id": "EXAMPLE0000000000002",
+      "company_id": "EXAMPLE0000000000003",
+      "secrets": {
+        "GHL_API_KEY": "GHL_PRIVATE_INTEGRATION_TOKEN",
+        "GHL_FIREBASE_API_KEY": "GHL_FIREBASE_API_KEY",
+        "GHL_FIREBASE_REFRESH_TOKEN": "GHL_FIREBASE_REFRESH_TOKEN"
+      },
+      "callers": [
+        "scout",
+        "aya",
+        "dev",
+        "fiona",
+        "cadence"
+      ]
+    },
+    "ghl_kcnext": {
+      "account": "KC Power Clean Inc. (KCNext)",
+      "location_id": "EXAMPLE0000000000004",
+      "credential_owner": "scout",
+      "user_id": "EXAMPLE0000000000002",
+      "company_id": "EXAMPLE0000000000003",
+      "secrets": {
+        "GHL_API_KEY": "GHL_KCNEXT_PRIVATE_INTEGRATION_TOKEN",
+        "GHL_FIREBASE_API_KEY": "GHL_FIREBASE_API_KEY",
+        "GHL_FIREBASE_REFRESH_TOKEN": "GHL_FIREBASE_REFRESH_TOKEN"
+      },
+      "callers": [
+        "scout",
+        "aya",
+        "dev",
+        "fiona",
+        "cadence"
+      ]
+    },
+    "ghl_lionsden": {
+      "account": "Lion's Den (Kris Cook Executive Coaching)",
+      "location_id": "EXAMPLE0000000000005",
+      "credential_owner": "roary",
+      "user_id": "EXAMPLE0000000000006",
+      "company_id": "EXAMPLE0000000000003",
+      "secrets": {
+        "GHL_API_KEY": "LD_GHL_PRIVATE_INTEGRATION_TOKEN",
+        "GHL_FIREBASE_API_KEY": "LD_GHL_FIREBASE_API_KEY",
+        "GHL_FIREBASE_REFRESH_TOKEN": "LD_GHL_FIREBASE_REFRESH_TOKEN"
+      },
+      "callers": [
+        "roary",
+        "brand"
+      ]
+    },
+    "ghl_lionsden_demo": {
+      "account": "Lion's Den GHL Demo Account",
+      "location_id": "EXAMPLE0000000000007",
+      "credential_owner": "roary",
+      "user_id": "EXAMPLE0000000000006",
+      "company_id": "EXAMPLE0000000000003",
+      "secrets": {
+        "GHL_API_KEY": "LD_GHL_DEMO_PRIVATE_INTEGRATION_TOKEN",
+        "GHL_FIREBASE_API_KEY": "LD_GHL_FIREBASE_API_KEY",
+        "GHL_FIREBASE_REFRESH_TOKEN": "LD_GHL_FIREBASE_REFRESH_TOKEN"
+      },
+      "callers": [
+        "roary",
+        "brand"
+      ]
+    },
+    "ghl_agency_admin": {
+      "account": "Agency: Kris Cook Executive Coaching LLC (all sub-accounts; default Lion's Den)",
+      "location_id": "EXAMPLE0000000000005",
+      "pinned": false,
+      "credential_owner": "roary",
+      "user_id": "EXAMPLE0000000000006",
+      "company_id": "EXAMPLE0000000000003",
+      "secrets": {
+        "GHL_API_KEY": "LD_GHL_AGENCY_PRIVATE_INTEGRATION_TOKEN",
+        "GHL_FIREBASE_API_KEY": "LD_GHL_FIREBASE_API_KEY",
+        "GHL_FIREBASE_REFRESH_TOKEN": "LD_GHL_FIREBASE_REFRESH_TOKEN"
+      },
+      "callers": [
+        "roary",
+        "brand"
+      ]
+    }
+  }
+}
