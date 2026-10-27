@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""kc-ghl-token-keeper: the single writer for GHL Firebase logins.
+
+Runs from a systemd timer every 10 minutes. For each login in the lane registry it
+keeps a fresh Firebase ID token in the shared cache (so lanes almost never refresh
+themselves) and owns refresh-token rotation:
+
+  1. Exchange the newest working refresh token: a lane's pending hand-off first,
+     then the vault value, then the vault's _PREV backup.
+  2. If Firebase returns a different refresh token, write it to the pending file
+     first (crash safety), back up the old vault value to <KEY>_PREV, store the new
+     value under <KEY>, read it back, then clear the pending file.
+  3. Write the ID token to the shared cache atomically.
+
+Same cache format and lock protocol as src/kc/lane.ts. Never prints token values;
+logs use 8-character SHA-256 prefixes. Alerts Slack on a dead login, on 3 straight
+failures, and on recovery.
+
+  kc-ghl-token-keeper            run once (what the timer does)
+  kc-ghl-token-keeper --status   show login health
+  kc-ghl-token-keeper --force    refresh even if the cached token is fresh
+"""
+import argparse, base64, hashlib, json, os, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
+from datetime import datetime, timezone
+
+REGISTRY = os.environ.get('KC_GHL_REGISTRY', '/home/aya/.local/share/kc-ghl/lanes.json')
+SECRET_BIN = os.environ.get('KC_SECRET_BIN', '/home/aya/.local/bin/kc-secret')
+TOKEN_URL = os.environ.get('KC_GHL_FIREBASE_TOKEN_URL', 'https://securetoken.googleapis.com/v1/token')
+ALERT_CHANNEL = os.environ.get('KC_GHL_ALERT_CHANNEL', '')
+REFRESH_WHEN_LEFT_S = 25 * 60       # keep at least this much ID-token life in the cache
+LOGIN_BUDGET_S = 90                 # per login, including 429 backoff
+LOCK_WAIT_S = 60
+LOCK_ABANDONED_S = 600
+LOCK_INIT_GRACE_S = 30
+ALERT_AFTER_FAILURES = 3
+DEAD = ('INVALID_REFRESH_TOKEN', 'TOKEN_EXPIRED', 'USER_DISABLED', 'USER_NOT_FOUND', 'INVALID_ID_TOKEN', 'PROJECT_NUMBER_MISMATCH', 'MISSING_REFRESH_TOKEN')
+
+
+def now():
+    return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+
+def fp(value):
+    return hashlib.sha256(value.encode()).hexdigest()[:8] if value else '-'
+
+
+def log(msg):
+    print(f'{now()} {msg}', flush=True)
+
+
+class Transient(Exception):
+    pass
+
+
+class Dead(Exception):
+    pass
+
+
+# ── vault ────────────────────────────────────────────────────
+def vault_get(key):
+    r = subprocess.run([SECRET_BIN, 'get', key], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20)
+    return r.stdout.strip() if r.returncode == 0 else ''
+
+
+def vault_set(key, value):
+    r = subprocess.run([SECRET_BIN, 'set', key], input=value, capture_output=True, text=True, timeout=20)
+    if r.returncode != 0:
+        raise RuntimeError(f'vault write failed for {key}')
+    if vault_get(key) != value:
+        raise RuntimeError(f'vault readback mismatch for {key}')
+
+
+# ── JWT / cache ──────────────────────────────────────────────
+def jwt_exp_ms(token):
+    parts = token.split('.') if isinstance(token, str) else []
+    if len(parts) != 3 or not all(parts):
+        return None
+    try:
+        pad = parts[1] + '=' * (-len(parts[1]) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(pad)).get('exp')
+        return int(exp * 1000) if isinstance(exp, (int, float)) else None
+    except Exception:
+        return None
+
+
+def cache_left_s(cache_file):
+    try:
+        c = read_json(cache_file)
+        exp = jwt_exp_ms(c.get('idToken'))
+        if exp is not None and c.get('expiresAt') == exp:
+            return (exp - time.time() * 1000) / 1000
+    except Exception:
+        pass
+    return -1
+
+
+def write_atomic(path, text):
+    tmp = f'{path}.{os.getpid()}.tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def read_or_empty(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ''
+
+
+def read_json(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+# ── lock (same protocol as src/kc/lane.ts) ───────────────────
+def pid_alive(pid):
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def claim_abandoned(lock):
+    try:
+        st = os.stat(lock)
+    except OSError:
+        return
+    text = read_or_empty(lock)
+    age = time.time() - st.st_mtime
+    if text == '':
+        abandoned = age > LOCK_INIT_GRACE_S
+    else:
+        abandoned = (not text.isdigit()) or (not pid_alive(int(text))) or age > LOCK_ABANDONED_S
+    if not abandoned:
+        return
+    claimed = f'{lock}.abandoned-{os.getpid()}-{int(time.time() * 1000)}'
+    try:
+        os.rename(lock, claimed)
+    except OSError:
+        return
+    try:
+        if os.stat(claimed).st_ino != st.st_ino:
+            try:
+                os.link(claimed, lock)
+            except OSError:
+                pass
+    finally:
+        try:
+            os.unlink(claimed)
+        except OSError:
+            pass
+
+
+class Lock:
+    def __init__(self, path):
+        self.path, self.ino = path, None
+
+    def __enter__(self):
+        deadline = time.time() + LOCK_WAIT_S
+        while True:
+            try:
+                fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                break
+            except FileExistsError:
+                if time.time() > deadline:
+                    raise Transient('another process held the refresh lock for 60 s')
+                claim_abandoned(self.path)
+                time.sleep(0.5)
+        self.ino = os.fstat(fd).st_ino
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            if os.stat(self.path).st_ino == self.ino and read_or_empty(self.path) == str(os.getpid()):
+                os.unlink(self.path)
+        except OSError:
+            pass
+        return False
+
+
+# ── Firebase ─────────────────────────────────────────────────
+def exchange_once(api_key, refresh_token):
+    body = urllib.parse.urlencode({'grant_type': 'refresh_token', 'refresh_token': refresh_token}).encode()
+    req = urllib.request.Request(f'{TOKEN_URL}?key={urllib.parse.quote(api_key)}', data=body,
+                                 headers={'Content-Type': 'application/x-www-form-urlencoded'})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            d = json.loads(r.read())
+        return d.get('id_token', ''), d.get('refresh_token', '')
+    except urllib.error.HTTPError as e:
+        text = e.read().decode('utf-8', 'replace')[:400]
+        if e.code == 429 or e.code >= 500:
+            raise Transient(f'HTTP {e.code}')
+        code = next((c for c in DEAD if c in text), None)
+        if code:
+            raise Dead(code)
+        raise Transient(f'HTTP {e.code}')
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise Transient(type(e).__name__)
+
+
+def exchange(api_key, refresh_token, deadline):
+    for wait in (5, 15, 30, None):
+        try:
+            return exchange_once(api_key, refresh_token)
+        except Transient:
+            if wait is None or time.time() + wait > deadline:
+                raise
+            time.sleep(wait)
+
+
+# ── one login ────────────────────────────────────────────────
+def keep_login(login, cache_dir, force):
+    api_key = vault_get(login['api_key_name'])
+    if not api_key:
+        raise Dead(f"vault key {login['api_key_name']} missing")
+    cid = hashlib.sha256(f"{login['credential']}:{api_key}".encode()).hexdigest()[:24]
+    cache_file = os.path.join(cache_dir, f'{cid}.json')
+    pending_file = os.path.join(cache_dir, f'{cid}.refresh-pending')
+    key = login['refresh_key']
+    if not force and not os.path.exists(pending_file) and cache_left_s(cache_file) > REFRESH_WHEN_LEFT_S:
+        return 'fresh'
+    with Lock(os.path.join(cache_dir, f'{cid}.lock')):
+        if not force and not os.path.exists(pending_file) and cache_left_s(cache_file) > REFRESH_WHEN_LEFT_S:
+            return 'fresh'
+        current = vault_get(key)
+        candidates = []
+        for label, value in (('pending', read_or_empty(pending_file)), ('vault', current), ('vault-prev', vault_get(f'{key}_PREV'))):
+            if value and value not in [v for _, v in candidates]:
+                candidates.append((label, value))
+        if not candidates:
+            raise Dead(f'no refresh token in vault key {key}')
+        deadline = time.time() + LOGIN_BUDGET_S
+        dead = []
+        for label, used in candidates:
+            try:
+                id_token, new_rt = exchange(api_key, used, deadline)
+                break
+            except Dead as e:
+                dead.append(f'{label}:{e}')
+        else:
+            raise Dead('all refresh tokens rejected (' + ', '.join(dead) + '); log in again and store a new token')
+        exp = jwt_exp_ms(id_token)
+        if exp is None:
+            raise Transient('Firebase returned a malformed ID token')
+        new_rt = new_rt or used
+        note = f'used {label} {fp(used)}'
+        if new_rt != current:
+            write_atomic(pending_file, new_rt)          # 1. crash safety: never lose the newest token
+            if current and current != new_rt and label != 'vault-prev':
+                vault_set(f'{key}_PREV', current)        # 2. rollback copy
+            vault_set(key, new_rt)                       # 3. promote (readback checked)
+            if read_or_empty(pending_file) == new_rt:     # 4. clear only what we promoted
+                os.unlink(pending_file)
+            note += f' | rotated vault {fp(current)} -> {fp(new_rt)}'
+        elif os.path.exists(pending_file) and read_or_empty(pending_file) == new_rt:
+            os.unlink(pending_file)
+        write_atomic(cache_file, json.dumps({'idToken': id_token, 'expiresAt': exp}))
+        return f'refreshed | {note} | id token valid {int((exp / 1000 - time.time()) / 60)} min'
+
+
+# ── registry, status, alerts ─────────────────────────────────
+def logins_from_registry(reg):
+    seen = {}
+    for name, lane in reg['lanes'].items():
+        if lane.get('pending'):
+            continue
+        s = lane.get('secrets', {})
+        if 'GHL_FIREBASE_REFRESH_TOKEN' not in s or 'GHL_FIREBASE_API_KEY' not in s:
+            continue
+        cred = f"{lane['credential_owner']}:{s['GHL_FIREBASE_REFRESH_TOKEN']}"
+        seen.setdefault(cred, {'credential': cred, 'refresh_key': s['GHL_FIREBASE_REFRESH_TOKEN'],
+                               'api_key_name': s['GHL_FIREBASE_API_KEY'], 'lanes': []})['lanes'].append(name)
+    return list(seen.values())
+
+
+def slack(text):
+    if not ALERT_CHANNEL:
+        return
+    token = vault_get('SCOUT_SLACK_BOT_TOKEN')
+    if not token:
+        return
+    req = urllib.request.Request('https://slack.com/api/chat.postMessage',
+                                 data=json.dumps({'channel': ALERT_CHANNEL, 'text': text}).encode(),
+                                 headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json; charset=utf-8'})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            ok = json.loads(r.read()).get('ok')
+        log(f'alert posted to Slack: {ok}')
+    except Exception as e:
+        log(f'alert post failed: {type(e).__name__}')
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--status', action='store_true')
+    ap.add_argument('--force', action='store_true')
+    a = ap.parse_args()
+    reg = read_json(REGISTRY)
+    cache_dir = reg['token_cache_dir']
+    os.makedirs(cache_dir, mode=0o700, exist_ok=True)
+    status_file = os.path.join(cache_dir, 'keeper-status.json')
+    try:
+        status = read_json(status_file)
+    except Exception:
+        status = {}
+    if a.status:
+        for cred, s in sorted(status.items()):
+            print(f"{cred:45} {s.get('state', '?'):8} last ok {s.get('last_ok', '-')} | failures {s.get('failures', 0)} | "
+                  f"last rotation {s.get('last_rotation', '-')} | {s.get('last_error', '')}")
+        return 0
+    failed = 0
+    for login in logins_from_registry(reg):
+        cred = login['credential']
+        s = status.setdefault(cred, {'failures': 0})
+        try:
+            result = keep_login(login, cache_dir, a.force)
+            if s.get('alerted'):
+                slack(f":white_check_mark: GHL login `{cred}` is healthy again (lanes: {', '.join(login['lanes'])}).")
+            s.update(state='ok', failures=0, last_ok=now(), last_error='', alerted=False)
+            if 'rotated' in result:
+                s['last_rotation'] = now()
+            log(f'{cred} | {result}')
+        except (Dead, Transient, RuntimeError, OSError) as e:
+            failed += 1
+            dead = isinstance(e, Dead)
+            s.update(state='dead' if dead else 'retrying', failures=s.get('failures', 0) + 1,
+                     last_error=f'{type(e).__name__}: {e}', last_failure=now())
+            log(f'{cred} | FAILED ({s["failures"]}) | {s["last_error"]}')
+            if not s.get('alerted') and (dead or s['failures'] >= ALERT_AFTER_FAILURES):
+                slack(f":rotating_light: GHL login `{cred}` {'is dead and needs a new login' if dead else 'keeps failing to refresh'}"
+                      f" — {e}. Lanes affected: {', '.join(login['lanes'])}. Check: `kc-ghl-token-keeper --status`.")
+                s['alerted'] = True
+    write_atomic(status_file, json.dumps(status, indent=2))
+    return 1 if failed else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

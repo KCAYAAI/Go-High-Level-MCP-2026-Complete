@@ -117,11 +117,16 @@ await test('malformed ID token from Firebase is rejected, not cached', async () 
   try { await assert.rejects(() => client().listWorkflows({ limit: 1 }), /malformed ID token/); } finally { firebaseMode = 'ok'; }
   assert.equal(readFileSync(cacheFile(), 'utf8'), '{}');
 });
-await test('rotated refresh token is not adopted inside a lane', async () => {
+await test('rotated refresh token is handed to the keeper (0600 pending file), never adopted or written to the vault', async () => {
   writeFileSync(cacheFile(), '{}'); firebaseMode = 'rotate';
   const c = client();
   try { await c.listWorkflows({ limit: 1 }); } finally { firebaseMode = 'ok'; }
   assert.equal(c.config.firebaseRefreshToken, 'TEST_REFRESH');
+  const pending = cacheFile().replace('.json', '.refresh-pending');
+  assert.equal(readFileSync(pending, 'utf8'), 'ROTATED');
+  const { statSync, unlinkSync } = await import('node:fs');
+  assert.equal(statSync(pending).mode & 0o777, 0o600);
+  unlinkSync(pending);
 });
 await test('a token GHL rejects (401) is cleared from memory and the shared cache', async () => {
   await client().listWorkflows({ limit: 1 });

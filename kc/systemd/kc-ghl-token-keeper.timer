@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the KC GHL token keeper every 10 minutes
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=10m
+RandomizedDelaySec=30s
+Persistent=true
+Unit=kc-ghl-token-keeper.service
+
+[Install]
+WantedBy=timers.target

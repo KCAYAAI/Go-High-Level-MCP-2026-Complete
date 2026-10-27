@@ -14,7 +14,7 @@ import { resolve, join } from 'path';
 import {
   kcSleep, kcLaneMode, kcPinned, kcAssertId, kcAssertLocationAllowed, kcCheckCall, kcCheckWrite,
   kcRequestSignal, kcRemainingMs, kcClaimAbandonedLock, kcReleaseLock, kcHeldLocks, kcJwtExp,
-  KC_AUTH_BUDGET_MS, kcCredentialName,
+  KC_AUTH_BUDGET_MS, kcCredentialName, kcStashRotatedRefreshToken,
 } from '../kc/lane.js';
 
 // ─── Types ──────────────────────────────────────────────────
@@ -268,7 +268,8 @@ export class WorkflowBuilderClient {
       if (kcLaneMode()) {
         // The vault is the source of truth for lanes. Google's securetoken endpoint does not
         // rotate Firebase refresh tokens in practice; if it ever does, make it loud.
-        process.stderr.write('[KC GHL] WARNING: Firebase returned a rotated refresh token; the vault still holds the previous value\n');
+        kcStashRotatedRefreshToken(this.kcCacheFile, data.refresh_token);
+        process.stderr.write('[KC GHL] Firebase rotated the refresh token; handed to kc-ghl-token-keeper for the vault\n');
       } else {
         this.config.firebaseRefreshToken = data.refresh_token;
         this.persistToken('GHL_FIREBASE_REFRESH_TOKEN', data.refresh_token);

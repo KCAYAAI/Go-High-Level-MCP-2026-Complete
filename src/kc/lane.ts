@@ -15,7 +15,7 @@
  */
 import { AsyncLocalStorage } from 'async_hooks';
 import {
-  appendFileSync, mkdirSync, readFileSync, statSync, renameSync, linkSync, unlinkSync,
+  appendFileSync, mkdirSync, readFileSync, statSync, renameSync, linkSync, unlinkSync, writeFileSync,
 } from 'fs';
 import { dirname, join } from 'path';
 
@@ -274,6 +274,24 @@ export function kcCredentialName(): string {
 }
 
 process.once('exit', () => { for (const f of [...kcHeldLocks.keys()]) kcReleaseLock(f); });
+
+/**
+ * A lane never writes the vault. If Firebase hands back a new refresh token, the lane leaves it
+ * here (0600, in the 0700 cache dir) for kc-ghl-token-keeper, the single writer, to verify and
+ * promote into the vault. Without this, a provider that revokes the old token on rotation would
+ * strand the login.
+ */
+export function kcStashRotatedRefreshToken(cacheFile: string | null, token: string): void {
+  if (!cacheFile) return;
+  const pending = cacheFile.replace(/\.json$/, '.refresh-pending');
+  const tmp = `${pending}.${process.pid}.tmp`;
+  try {
+    writeFileSync(tmp, token, { mode: 0o600 });
+    renameSync(tmp, pending);
+  } catch {
+    // best effort; the keeper still refreshes from the vault
+  }
+}
 
 /** `exp` (ms) of a 3-part JWT, or null if malformed. */
 export function kcJwtExp(token: unknown): number | null {

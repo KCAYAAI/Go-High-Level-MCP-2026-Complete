@@ -1,0 +1,19 @@
+[Unit]
+Description=KC GHL token keeper: refresh Firebase logins, rotate refresh tokens into the vault
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=HOME=/home/aya
+Environment=KC_GHL_REGISTRY=/home/aya/.local/share/kc-ghl/lanes.json
+Environment=KC_GHL_ALERT_CHANNEL=C0BL2LDCVPH
+WorkingDirectory=/home/aya/.local/share/kc-ghl
+ExecStart=/usr/bin/flock -n %t/kc-ghl-token-keeper.lock /home/aya/.local/share/kc-ghl/current/kc/bin/kc-ghl-token-keeper
+TimeoutStartSec=300
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/aya/.secrets /home/aya/.local/share/kc-ghl
+UMask=0077
