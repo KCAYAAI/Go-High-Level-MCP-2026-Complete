@@ -20,11 +20,12 @@ Object.assign(process.env, {
   GHL_LOCATION_ID: B, GHL_FIREBASE_API_KEY: 'web-key', GHL_FIREBASE_REFRESH_TOKEN: 'TEST_REFRESH', GHL_API_KEY: 'pit',
 });
 
-let firebaseCalls = 0, firebaseMode = 'ok', sent = [], workflowStatus = 200, workflowDelayMs = 0, failMethod = null;
+let firebaseCalls = 0, firebaseMode = 'ok', sent = [], workflowStatus = 200, workflowDelayMs = 0, failMethod = null, firebaseDelayMs = 0;
 globalThis.fetch = async (url, opts = {}) => {
   const u = String(url);
   if (u.includes('securetoken')) {
     firebaseCalls++;
+    if (firebaseDelayMs) await new Promise((r) => setTimeout(r, firebaseDelayMs));
     if (firebaseMode === '429') return new Response(JSON.stringify({ error: { message: 'QUOTA' } }), { status: 429 });
     if (firebaseMode === 'malformed') return new Response(JSON.stringify({ id_token: 'not-a-jwt' }), { status: 200 });
     if (firebaseMode === 'rotate') return new Response(JSON.stringify({ id_token: freshJwt(), refresh_token: 'ROTATED' }), { status: 200 });
@@ -309,6 +310,18 @@ await test('create: not started when the call cannot fit all its writes; nothing
     });
   });
   assert.equal(sent.filter((s) => s.method !== 'GET').length, 0);
+});
+await test('create: a slow login that eats the budget stops the create before any write', async () => {
+  const tools = new WorkflowBuilderTools(); writeFileSync(cacheFile(), '{}'); sent = []; firebaseDelayMs = 45_000;
+  try {
+    await fakeClock(async () => {
+      await lane.kcRunToolCall('ghl_create_workflow', undefined, async () => {
+        const res = await tools.executeWorkflowBuilderTool('ghl_create_workflow', { name: 'x', actions: [{ type: 'wait', name: 'w' }] });
+        assert.match(res.content[0].text, /not started.*Nothing was sent/s);
+      });
+    });
+  } finally { firebaseDelayMs = 0; }
+  assert.equal(sent.filter((x) => x.method !== 'GET').length, 0, 'no write sent');
 });
 await test('create without actions needs only one write and still runs with 60 s left', async () => {
   const tools = new WorkflowBuilderTools(); sent = [];

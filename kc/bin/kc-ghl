@@ -20,7 +20,7 @@ import argparse, json, os, re, shutil, subprocess, sys, time, urllib.error, urll
 
 REGISTRY = os.environ.get('KC_GHL_REGISTRY', '/home/aya/.local/share/kc-ghl/lanes.json')
 WORKDIR = '/home/aya/.local/share/kc-ghl'  # no .env here; the server never reads a stray one
-SECRET_HELPER = '/home/aya/.local/bin/kc-secret'
+SECRET_HELPER = os.environ.get('KC_SECRET_BIN', '/home/aya/.local/bin/kc-secret')
 
 
 def fail(msg, code=2):
@@ -34,6 +34,53 @@ def load():
             return json.load(f)
     except (OSError, ValueError) as e:
         fail(f'cannot read lane registry: {type(e).__name__}')
+
+
+ID20 = re.compile(r'[A-Za-z0-9]{20}')
+KEYNAME = re.compile(r'[A-Z][A-Z0-9_]*')
+
+
+def validate(reg):
+    """Fail cleanly (exit 2, one line) on any malformed registry; never a traceback."""
+    if not isinstance(reg, dict):
+        fail('lane registry must be a JSON object')
+    for k in ('server', 'token_cache_dir', 'audit_log'):
+        if not isinstance(reg.get(k), str) or not reg[k].startswith('/'):
+            fail(f'lane registry: {k} must be an absolute path')
+    if not isinstance(reg.get('lanes'), dict) or not reg['lanes']:
+        fail('lane registry: lanes must be a non-empty object')
+    if not isinstance(reg.get('common_env', {}), dict):
+        fail('lane registry: common_env must be an object')
+    for name, lane in reg['lanes'].items():
+        where = f'lane {name}'
+        if not isinstance(lane, dict):
+            fail(f'{where} must be an object')
+        if lane.get('pending'):
+            continue
+        for k in ('location_id', 'user_id', 'company_id'):
+            if not isinstance(lane.get(k), str) or not ID20.fullmatch(lane[k]):
+                fail(f'{where}: {k} must be a 20-character ID')
+        if not isinstance(lane.get('credential_owner'), str) or not lane['credential_owner']:
+            fail(f'{where}: credential_owner is required')
+        if not isinstance(lane.get('pinned', True), bool):
+            fail(f'{where}: pinned must be true or false')
+        callers = lane.get('callers')
+        if not isinstance(callers, list) or not callers or not all(isinstance(c, str) and c for c in callers):
+            fail(f'{where}: callers must be a non-empty list of profile names')
+        secrets = lane.get('secrets')
+        if not isinstance(secrets, dict) or not secrets or not all(
+                isinstance(k, str) and isinstance(v, str) and KEYNAME.fullmatch(v) for k, v in secrets.items()):
+            fail(f'{where}: secrets must map env names to vault key names')
+        if 'GHL_API_KEY' not in secrets:
+            fail(f'{where}: secrets must include GHL_API_KEY')
+        lt = lane.get('location_tokens', {})
+        if not isinstance(lt, dict) or not all(isinstance(k, str) and ID20.fullmatch(k) and isinstance(v, str) and KEYNAME.fullmatch(v) for k, v in lt.items()):
+            fail(f'{where}: location_tokens must map 20-character location IDs to vault key names')
+        if lt and lane.get('pinned', True):
+            fail(f'{where}: location_tokens is only for unpinned (agency) lanes')
+        env = lane.get('env', {})
+        if not isinstance(env, dict) or not all(isinstance(k, str) and (v is None or isinstance(v, (str, int))) for k, v in env.items()):
+            fail(f'{where}: env must map names to strings')
 
 
 def secret(name):
@@ -114,7 +161,8 @@ def main():
     ap.add_argument('--replace', action='store_true')
     a = ap.parse_args()
     reg = load()
-    lanes = reg.get('lanes', {})
+    validate(reg)
+    lanes = reg['lanes']
 
     if a.add_subaccount:
         add_subaccount(reg, a.lane or 'ghl_agency_admin', a.add_subaccount, a.vault_key, a.replace)
@@ -133,11 +181,6 @@ def main():
         fail(f'unknown lane {a.lane}')
     if a.caller not in lane.get('callers', []):
         fail(f'caller {a.caller} is not approved for lane {a.lane}')
-    for key in ('location_id', 'user_id', 'company_id', 'credential_owner', 'secrets'):
-        if not lane.get(key):
-            fail(f'lane {a.lane} is missing {key} in the registry')
-    if not isinstance(lane.get('pinned', True), bool):
-        fail(f'lane {a.lane}: pinned must be true or false')
     if lane.get('pending'):
         fail(f"lane {a.lane} is not ready: {lane['pending']}")
 
@@ -161,11 +204,7 @@ def main():
         env[env_name] = secret(vault_name)
     # Agency lane: one private integration per sub-account ({locationId: vault key}).
     loc_tokens = lane.get('location_tokens') or {}
-    if not isinstance(loc_tokens, dict):
-        fail(f'lane {a.lane}: location_tokens must be an object of locationId -> vault key')
     if loc_tokens:
-        if lane.get('pinned', True):
-            fail(f'lane {a.lane}: location_tokens is only for unpinned (agency) lanes')
         env['KC_GHL_LOCATION_TOKENS'] = json.dumps({loc: secret(key) for loc, key in loc_tokens.items()})
     for k, v in (lane.get('env') or {}).items():
         if v is None or v == '':

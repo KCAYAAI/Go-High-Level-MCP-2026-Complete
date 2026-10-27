@@ -386,7 +386,8 @@ export class WorkflowBuilderTools {
     const trigger = params.trigger as WorkflowTrigger | undefined;
     const publish = params.publish as boolean | undefined;
     const needsUpdate = !!(rawActions?.length || trigger || publish);
-    // KC lanes: do not start unless every write fits in this tool call.
+    // KC lanes: log in first (that can take time), then refuse to start unless every write still fits.
+    if (kcLaneMode()) await c.kcPrepareAuth();
     kcPlanRequests('create workflow', needsUpdate ? 3 : 1);
 
     // Step 1: Create empty workflow

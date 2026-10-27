@@ -114,6 +114,11 @@ export class WorkflowBuilderClient {
    * A client for another sub-account with the same login. In a pinned lane only the
    * pinned account is allowed; in an unpinned (agency) lane any valid location ID is.
    */
+  /** Make sure a valid login token is in hand (refreshing if needed) before planning a multi-write operation. */
+  async kcPrepareAuth(): Promise<void> {
+    await this.getHeaders();
+  }
+
   forLocation(locationId: string): WorkflowBuilderClient {
     kcAssertLocationAllowed(locationId);
     if (locationId === this.config.locationId) return this;
