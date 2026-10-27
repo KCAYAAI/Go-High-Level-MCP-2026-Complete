@@ -64,7 +64,7 @@ import { OAuthTools } from './tools/oauth-tools.js';
 import { OfficialSpecTools } from './tools/official-spec-tools.js';
 import { WorkflowInsightsTools } from './tools/workflow-insights-tools.js';
 import { AgentWorkspaceTools } from './tools/agent-workspace-tools.js';
-import { kcRunToolCall } from './kc/lane.js';
+import { kcRunToolCall, kcLaneMode } from './kc/lane.js';
 
 // ─── Types ──────────────────────────────────────────────────
 
@@ -404,8 +404,10 @@ export class ToolRegistry {
       const { name, arguments: args } = request.params;
       if (!this.isToolVisible(name)) throw new McpError(ErrorCode.InvalidParams, `Unknown tool: ${name}`);
       try {
-        // KC lanes: per-call deadline, caller cancellation, audit line (no-op outside lanes).
-        const result = await kcRunToolCall(name, extra?.signal, () => this.callTool(name, args ?? {}));
+        // KC lanes only: per-call deadline, caller cancellation, audit line. Outside a lane: upstream path.
+        const result = kcLaneMode()
+          ? await kcRunToolCall(name, extra?.signal, () => this.callTool(name, args ?? {}))
+          : await this.callTool(name, args ?? {});
         return toMcpResult(result);
       } catch (error) {
         if (error instanceof ToolInputError) throw new McpError(ErrorCode.InvalidParams, error.message);

@@ -19,7 +19,7 @@ import {
   WorkflowTrigger,
 } from '../clients/workflow-builder-client.js';
 
-import { kcPlanRequests, KcPartialWriteError } from '../kc/lane.js';
+import { kcPlanRequests, KcPartialWriteError, kcLaneMode } from '../kc/lane.js';
 
 /** Tool result for a multi-step write that created something and then failed: name it, never hide it. */
 function kcPartialResult(err: KcPartialWriteError, c: WorkflowBuilderClient): ToolResult {
@@ -394,6 +394,7 @@ export class WorkflowBuilderTools {
     try {
       return await this.finishCreateWorkflow(c, id, name, rawActions, trigger, publish);
     } catch (err) {
+      if (!kcLaneMode()) throw err;
       return kcPartialResult(new KcPartialWriteError(id, `creating the empty workflow "${name}"`, 'a later step (adding actions, trigger, publish, or reading it back)', err), c);
     }
   }

@@ -286,10 +286,10 @@ export class WorkflowBuilderClient {
   private async refreshFirebaseTokenShared(): Promise<void> {
     const deadline = Date.now() + Math.min(KC_AUTH_BUDGET_MS, kcRemainingMs() - 5_000);
     const dir = process.env.KC_GHL_TOKEN_CACHE_DIR;
-    if (!dir) {
-      // Outside a KC lane: original upstream behavior (no shared cache, legacy TTL fallback).
-      await this.refreshFirebaseTokenWithBackoff(deadline);
-      this.tokenExpiry = (kcJwtExp(this.cachedIdToken) ?? Date.now() + WorkflowBuilderClient.TOKEN_TTL_MS) - 120_000;
+    if (!kcLaneMode() || !dir) {
+      // Outside a KC lane: exactly the upstream refresh (no shared cache, no backoff, upstream TTL).
+      await this.refreshFirebaseToken();
+      this.tokenExpiry = Date.now() + WorkflowBuilderClient.TOKEN_TTL_MS;
       return;
     }
     mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -420,11 +420,43 @@ export class WorkflowBuilderClient {
 
   // ─── HTTP Helper ────────────────────────────────────────
 
+  /** Upstream request(), unchanged: used outside KC lanes. */
+  private async upstreamRequest<T = unknown>(
+    method: string,
+    path: string,
+    body?: unknown
+  ): Promise<{ status: number; data: T }> {
+    const headers = await this.getHeaders();
+    const url = `${WorkflowBuilderClient.BASE_URL}${path}`;
+
+    const opts: RequestInit = { method, headers };
+    if (body) opts.body = JSON.stringify(body);
+
+    const res = await fetch(url, opts);
+    const text = await res.text();
+
+    let data: T;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = text as unknown as T;
+    }
+
+    if (!res.ok) {
+      throw new Error(
+        `GHL Workflow API error ${res.status} ${method} ${path}: ${typeof data === 'string' ? data : JSON.stringify(data)}`
+      );
+    }
+
+    return { status: res.status, data };
+  }
+
   private async request<T = unknown>(
     method: string,
     path: string,
     body?: unknown
   ): Promise<{ status: number; data: T }> {
+    if (!kcLaneMode()) return this.upstreamRequest<T>(method, path, body);
     // KC lane guard: reject path tricks, then check the URL fetch will actually send.
     if (/\.\.|\\|%|#/.test(path.split('?')[0])) {
       throw new Error('KC lane guard: blocked a workflow request with an unsafe path');
@@ -492,7 +524,7 @@ export class WorkflowBuilderClient {
    * Get a workflow with full workflowData (actions, triggers, etc.)
    */
   async getWorkflow(workflowId: string): Promise<WorkflowFull> {
-    kcAssertId('workflow ID', workflowId);
+    if (kcLaneMode()) kcAssertId('workflow ID', workflowId);
     const { data } = await this.request<WorkflowFull>(
       'GET',
       `/${this.config.locationId}/${workflowId}`
@@ -537,7 +569,7 @@ export class WorkflowBuilderClient {
       deletedSteps?: string[];
     }
   ): Promise<WorkflowFull> {
-    kcAssertId('workflow ID', workflowId);
+    if (kcLaneMode()) kcAssertId('workflow ID', workflowId);
     // Get current state for version
     const current = await this.getWorkflow(workflowId);
 
@@ -598,7 +630,7 @@ export class WorkflowBuilderClient {
    * Delete a workflow.
    */
   async deleteWorkflow(workflowId: string): Promise<void> {
-    kcAssertId('workflow ID', workflowId);
+    if (kcLaneMode()) kcAssertId('workflow ID', workflowId);
     await this.request('DELETE', `/${this.config.locationId}/${workflowId}`);
   }
 
@@ -613,7 +645,7 @@ export class WorkflowBuilderClient {
    * Clone a workflow: GET → create new → PUT with same actions/triggers.
    */
   async cloneWorkflow(workflowId: string, newName?: string): Promise<WorkflowFull> {
-    kcAssertId('workflow ID', workflowId);
+    if (kcLaneMode()) kcAssertId('workflow ID', workflowId);
     const source = await this.getWorkflow(workflowId);
     const name = newName || `${source.name} (copy)`;
     // Counted from the first write on: POST create, then GET + PUT actions.
@@ -621,6 +653,7 @@ export class WorkflowBuilderClient {
 
     // Create empty workflow
     const { id: newId } = await this.createWorkflow(name);
+    if (!kcLaneMode()) return this.kcFinishClone(source, newId);
     try {
       return await this.kcFinishClone(source, newId);
     } catch (err) {
