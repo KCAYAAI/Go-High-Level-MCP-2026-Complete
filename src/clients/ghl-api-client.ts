@@ -494,7 +494,7 @@ export class GHLApiClient {
   private handleApiError(error: AxiosError<GHLErrorResponse>): Error {
     if (kcLaneMode() && !error.response) {
       // KC lane: guard refusals are not GHL errors, and a write cut off in flight has an unknown outcome.
-      if (typeof error.message === 'string' && error.message.startsWith('KC lane')) return new Error(error.message);
+      if (typeof error.message === 'string' && /^KC (lane|read-only lane|agency lane)\b/.test(error.message)) return new Error(error.message);
       const method = String(error.config?.method || 'get');
       if (kcIsWrite(method) && ['ERR_CANCELED', 'ECONNABORTED', 'ETIMEDOUT'].includes(String(error.code))) {
         return kcUnknownOutcome(method, String(error.config?.url || 'request'));

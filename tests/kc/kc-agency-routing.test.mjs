@@ -137,6 +137,13 @@ await t('R6: read-only lane refuses writes before sending; reads and read-POSTs 
     assert.equal(sent.length, 3);
   } finally { delete process.env.KC_GHL_READ_ONLY; }
 });
+await t('R6: read-only and agency refusals are reported as KC refusals, not GHL 500s', async () => {
+  process.env.KC_GHL_READ_ONLY = '1';
+  let msg = ''; try { await ax.put('/contacts/abc', {}, { params: { locationId: A } }); } catch (e) { msg = e.message; } finally { delete process.env.KC_GHL_READ_ONLY; }
+  assert.match(msg, /^KC read-only lane/);
+  msg = ''; try { await ax.get('/contacts/', { params: { locationIds: [A, B] } }); } catch (e) { msg = e.message; }
+  assert.match(msg, /^KC agency lane/);
+});
 await t('R6: without the read-only flag, writes are not refused by the lane', async () => {
   await ax.put('/contacts/abc', {}, { params: { locationId: A } }); assert.equal(sent.length, 1);
 });
