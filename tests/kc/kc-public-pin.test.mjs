@@ -142,6 +142,14 @@ await t('F5: a JSON string body that is deep is refused, not swallowed', async (
   let deep = { locationId: A }; for (let i = 0; i < 20; i++) deep = { x: deep };
   await blocked(ax.post('/contacts/', JSON.stringify(deep)));
 });
+await t('F2: an absolute URL to another host is refused before any token is sent', async () => {
+  await assert.rejects(ax.get('https://attacker.example/contacts/'), /host other than the GHL API/);
+  await assert.rejects(ax.get('http://services.leadconnectorhq.com.evil.example/x'), /host other than the GHL API/);
+  assert.equal(sent.length, 0);
+});
+await t('F2: an absolute URL to the configured API host still works', async () => {
+  await ax.get(`https://services.leadconnectorhq.com/locations/${B}`); assert.equal(sent.length, 1);
+});
 await t('agency lane (unpinned) allows any account', async () => {
   delete process.env.KC_GHL_PINNED_LOCATION; sent = [];
   try { await ax.get(`/locations/${A}`); assert.equal(sent.length, 1); } finally { process.env.KC_GHL_PINNED_LOCATION = B; }

@@ -60,7 +60,11 @@ def vault_get(key):
         r = subprocess.run([SECRET_BIN, 'get', key], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20)
     except (subprocess.TimeoutExpired, OSError) as e:
         raise Transient(f'vault read timed out or failed ({type(e).__name__})')
-    return r.stdout.strip() if r.returncode == 0 else ''
+    if r.returncode == 0:
+        return r.stdout.strip()
+    if 'missing key' in (r.stderr or ''):
+        return ''
+    raise Transient(f'vault read failed for {key} (exit {r.returncode})')
 
 
 def vault_set(key, value):
@@ -162,7 +166,8 @@ def exchange_once(api_key, refresh_token):
             raise Transient('Firebase returned an unexpected response')
         return d.get('id_token', ''), d.get('refresh_token', '')
     except urllib.error.HTTPError as e:
-        text = e.read().decode('utf-8', 'replace')[:400]
+        with e:
+            text = e.read().decode('utf-8', 'replace')[:400]
         if e.code == 429 or e.code >= 500:
             raise Transient(f'HTTP {e.code}')
         code = next((c for c in DEAD if c in text), None)
@@ -212,6 +217,8 @@ def keep_login(login, cache_dir, force):
                 break
             except Dead as e:
                 dead.append(f'{label}:{e}')
+                if label == 'pending' and read_or_empty(pending_file) == used:
+                    os.unlink(pending_file)  # rejected for good; never retried
         else:
             raise Dead('all refresh tokens rejected (' + ', '.join(dead) + '); log in again and store a new token')
         exp = jwt_exp_ms(id_token)
@@ -234,6 +241,25 @@ def keep_login(login, cache_dir, force):
 
 
 # ── registry, status, alerts ─────────────────────────────────
+def registry_problem(reg):
+    """The keeper only needs a few fields; report the first missing one (the launcher validates the rest)."""
+    if not isinstance(reg, dict):
+        return 'not a JSON object'
+    if not isinstance(reg.get('token_cache_dir'), str) or not reg['token_cache_dir'].startswith('/'):
+        return 'token_cache_dir must be an absolute path'
+    if not isinstance(reg.get('lanes'), dict):
+        return 'lanes must be an object'
+    for name, lane in reg['lanes'].items():
+        if not isinstance(lane, dict) or lane.get('pending'):
+            continue
+        s = lane.get('secrets')
+        if not isinstance(s, dict):
+            return f'lane {name}: secrets must be an object'
+        if 'GHL_FIREBASE_REFRESH_TOKEN' in s and not (isinstance(lane.get('credential_owner'), str) and lane['credential_owner']):
+            return f'lane {name}: credential_owner is required'
+    return ''
+
+
 def logins_from_registry(reg):
     seen = {}
     for name, lane in reg['lanes'].items():
@@ -277,7 +303,16 @@ def main():
     ap.add_argument('--status', action='store_true')
     ap.add_argument('--force', action='store_true')
     a = ap.parse_args()
-    reg = read_json(REGISTRY)
+    try:
+        reg = read_json(REGISTRY)
+        problem = registry_problem(reg)
+    except Exception as e:
+        reg, problem = None, f'cannot read registry ({type(e).__name__})'
+    if problem:
+        log(f'registry invalid: {problem}')
+        if not a.status:
+            slack(f':rotating_light: GHL token keeper cannot run: lane registry invalid ({problem}). Check `kc-ghl --list`.')
+        return 2
     cache_dir = reg['token_cache_dir']
     os.makedirs(cache_dir, mode=0o700, exist_ok=True)
     status_file = os.path.join(cache_dir, 'keeper-status.json')

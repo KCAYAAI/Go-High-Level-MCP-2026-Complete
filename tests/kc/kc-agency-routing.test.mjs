@@ -102,6 +102,14 @@ await t('F10: tool results with isError are audited as failures', async () => {
     assert.deepEqual(rows.map((r) => [r.tool, r.ok]), [['x', false], ['y', true]]);
   } finally { delete process.env.KC_GHL_AUDIT_LOG; }
 });
+await t('F1b: per-call locationId must be the default or a registered sub-account', async () => {
+  assert.throws(() => lane.kcSplitLocationArg({ locationId: 'Z'.repeat(20) }, false), /not registered in this lane/);
+  assert.equal(lane.kcSplitLocationArg({ locationId: A }, false).location, A);
+});
+await t('F2 (agency): absolute URL to another host is refused', async () => {
+  await assert.rejects(ax.get('https://attacker.example/contacts/', { params: { locationId: A } }), /host other than the GHL API/);
+  assert.equal(sent.length, 0);
+});
 await t('outside a KC lane nothing is routed', async () => {
   delete process.env.KC_GHL_LANE;
   try { await ax.get('/contacts/', { params: { locationId: A } }); assert.equal(auth(), 'Bearer tok-AGENCY'); } finally { process.env.KC_GHL_LANE = 'agency_test'; }

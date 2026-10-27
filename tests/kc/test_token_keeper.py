@@ -187,6 +187,39 @@ class KeeperTest(unittest.TestCase):
         self.run_keeper(); self.assertTrue(self.status().get('alerted'))
         self.run_keeper(); self.assertEqual(len(attempts), 2, 'no repeat after a delivered alert')
 
+    def test_dead_pending_token_is_removed(self):
+        self.k.vault_set('T_RT', 'GOOD'); self.run_keeper()
+        pending = [f for f in self.files('.json') if not f.endswith('keeper-status.json')][0][:-5] + '.refresh-pending'
+        with open(pending, 'w') as f:
+            f.write('STALE')
+        Firebase.DEAD = {'STALE'}
+        self.assertEqual(self.run_keeper('--force'), 0)
+        self.assertFalse(os.path.exists(pending), 'rejected hand-off token removed')
+        n = len(Firebase.CALLS); self.run_keeper('--force')
+        self.assertNotIn('STALE', Firebase.CALLS[n:])
+
+    def test_vault_read_error_is_transient_not_dead(self):
+        self.k.vault_set('T_RT', 'S'); self.run_keeper()
+        real_bin = self.k.SECRET_BIN
+        broken = os.path.join(self.tmp, 'broken-secret')
+        with open(broken, 'w') as f:
+            f.write('#!/bin/sh\necho "vault locked" >&2\nexit 3\n')
+        os.chmod(broken, 0o700)
+        self.k.SECRET_BIN = broken
+        try:
+            self.assertEqual(self.run_keeper('--force'), 1)
+            self.assertEqual(self.status()['state'], 'retrying')
+            self.assertIn('vault read failed', self.status()['last_error'])
+        finally:
+            self.k.SECRET_BIN = real_bin
+
+    def test_invalid_registry_is_reported_not_a_traceback(self):
+        reg = json.load(open(os.environ['KC_GHL_REGISTRY'])); del reg['token_cache_dir']
+        json.dump(reg, open(os.environ['KC_GHL_REGISTRY'], 'w'))
+        alerts = []; self.k.slack = lambda text: (alerts.append(text), True)[1]
+        self.assertEqual(self.run_keeper(), 2)
+        self.assertEqual(len(alerts), 1); self.assertIn('token_cache_dir', alerts[0])
+
     def _cid(self):
         cache = [f for f in self.files('.json') if not f.endswith('keeper-status.json')][0]
         return os.path.basename(cache)[:-5]

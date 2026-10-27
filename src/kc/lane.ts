@@ -69,6 +69,12 @@ export function kcSplitLocationArg(args: Record<string, unknown>, nativeLocation
   if (raw === undefined || raw === null || raw === '') return { args };
   if (typeof raw !== 'string' || !/^[A-Za-z0-9]{20}$/.test(raw)) throw new Error('KC lane guard: locationId must be a 20-character sub-account ID');
   kcAssertLocationAllowed(raw);
+  if (kcLaneMode() && !kcPinned()) {
+    const tokens = kcLocationTokens();
+    if (tokens.size > 0 && raw !== process.env.GHL_LOCATION_ID && !tokens.has(raw)) {
+      throw new Error(`KC agency lane: sub-account ${raw} is not registered in this lane (add it with kc-ghl --add-subaccount)`);
+    }
+  }
   if (nativeLocationArg) return { location: raw, args };
   const { locationId: _drop, ...rest } = args;
   return { location: raw, args: rest };
@@ -312,9 +318,17 @@ function kcCollectBodyLocations(data: unknown, out: unknown[], depth = 0): void 
 }
 
 /** Parse the final URL after refusing traversal, encoding, backslashes, dot/empty segments, control characters. */
-function kcSafeUrl(rawUrl: string, fullUrl: string): URL {
+function kcSafeUrl(rawUrl: string, fullUrl: string, baseUrl?: string): URL {
   const unsafe = () => { throw new Error('KC lane guard: blocked a public API request with an unsafe path'); };
-  const rawPath = rawUrl.split('?')[0].replace(/^[a-z]+:\/\/[^/]*/i, '');
+  if (baseUrl) {
+    // Tokens only ever go to the configured API host; an absolute URL to anywhere else is refused.
+    const origin = new URL(baseUrl).origin;
+    if (/^[a-z][a-z0-9+.-]*:/i.test(rawUrl) && !rawUrl.toLowerCase().startsWith(origin.toLowerCase() + '/')) {
+      throw new Error('KC lane guard: blocked a public API request to a host other than the GHL API');
+    }
+    if (new URL(fullUrl).origin !== origin) throw new Error('KC lane guard: blocked a public API request to a host other than the GHL API');
+  }
+  const rawPath = rawUrl.split('?')[0].replace(/^[a-z][a-z0-9+.-]*:\/\/[^/]*/i, '');
   if (/\.\.|%|\\|[\x00-\x1f\x7f]/.test(rawPath) || /(^|\/)\.(\/|$)/.test(rawPath) || rawPath.includes('//')) unsafe();
   const u = new URL(fullUrl);
   // Final path: no empty segments (an edge server that merges slashes would see a different route).
@@ -373,11 +387,11 @@ export function kcResetLocationTokensForTests(): void {
  * default sub-account (GHL_LOCATION_ID) token. Agency endpoints (catalog Agency-Access-only, plus
  * KC_DEFAULT_AGENCY_PATHS and KC_GHL_AGENCY_PATHS) always keep the agency token.
  */
-export function kcAgencyTokenFor(rawUrl: string, fullUrl: string, data: unknown): string | undefined {
+export function kcAgencyTokenFor(rawUrl: string, fullUrl: string, data: unknown, baseUrl?: string): string | undefined {
   if (!kcLaneMode() || kcPinned()) return undefined;
   const tokens = kcLocationTokens();
   if (tokens.size === 0) return undefined;
-  const u = kcSafeUrl(rawUrl, fullUrl);
+  const u = kcSafeUrl(rawUrl, fullUrl, baseUrl);
   const templates = kcLocationPathTemplates(); // also loads the agency-only list
   if (kcIsAgencyPath(u.pathname)) return undefined;
   const named: unknown[] = [];
@@ -410,11 +424,11 @@ export function kcAgencyTokenFor(rawUrl: string, fullUrl: string, data: unknown)
  * an explicit different location is refused, not redirected.
  * `fullUrl` must be the URL axios will actually send (axios.getUri(config)).
  */
-export function kcAssertPublicRequest(rawUrl: string, fullUrl: string, data: unknown): void {
+export function kcAssertPublicRequest(rawUrl: string, fullUrl: string, data: unknown, baseUrl?: string): void {
   const pin = kcPinned();
   if (!pin) return;
   const block = () => { throw new Error("KC lane guard: blocked a public API request for a location outside this lane's account"); };
-  const u = kcSafeUrl(rawUrl, fullUrl);
+  const u = kcSafeUrl(rawUrl, fullUrl, baseUrl);
   const named: unknown[] = [];
   for (const re of kcLocationPathTemplates()) {
     const m = u.pathname.match(re);

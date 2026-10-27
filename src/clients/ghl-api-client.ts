@@ -432,9 +432,9 @@ export class GHLApiClient {
       (config) => {
         if (kcLaneMode()) {
           // KC lanes: refuse other accounts on the final URL axios will send, and keep inside the call deadline.
-          kcAssertPublicRequest(String(config.url || ''), this.axiosInstance.getUri(config), config.data);
+          kcAssertPublicRequest(String(config.url || ''), this.axiosInstance.getUri(config), config.data, this.config.baseUrl);
           // Agency lane: send sub-account requests with that sub-account's own token.
-          const routed = kcAgencyTokenFor(String(config.url || ''), this.axiosInstance.getUri(config), config.data);
+          const routed = kcAgencyTokenFor(String(config.url || ''), this.axiosInstance.getUri(config), config.data, this.config.baseUrl);
           if (routed) {
             if (typeof config.headers?.set === 'function') config.headers.set('Authorization', `Bearer ${routed}`);
             else if (config.headers) (config.headers as Record<string, string>).Authorization = `Bearer ${routed}`;
