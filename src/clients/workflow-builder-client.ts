@@ -14,7 +14,7 @@ import { resolve, join } from 'path';
 import {
   kcSleep, kcLaneMode, kcPinned, kcAssertId, kcAssertLocationAllowed, kcCheckCall, kcCheckWrite,
   kcRequestSignal, kcRemainingMs, kcClaimAbandonedLock, kcReleaseLock, kcHeldLocks, kcJwtExp,
-  KC_AUTH_BUDGET_MS, kcCredentialName, kcStashRotatedRefreshToken, kcIsWrite, kcUnknownOutcome,
+  KC_AUTH_BUDGET_MS, kcCredentialName, kcStashRotatedRefreshToken, kcIsWrite, kcUnknownOutcome, kcJwtIat, KC_FRESH_TOKEN_MS,
   kcPlanRequests, KcPartialWriteError,
 } from '../kc/lane.js';
 
@@ -97,6 +97,8 @@ export class WorkflowBuilderClient {
   private static readonly TOKEN_TTL_MS = 55 * 60 * 1000; // 55 minutes (tokens last 60)
 
   private kcCacheFile: string | null = null;
+  /** ID token GHL rejected (401) in this process; never reused from the shared cache. */
+  private kcRejectedToken: string | null = null;
 
   constructor(config: WorkflowBuilderConfig) {
     this.config = config;
@@ -305,6 +307,7 @@ export class WorkflowBuilderClient {
       try {
         const c = JSON.parse(readFileSync(cacheFile, 'utf8')) as { idToken?: unknown; expiresAt?: unknown };
         const exp = kcJwtExp(c.idToken);
+        if (c.idToken === this.kcRejectedToken) return false; // GHL rejected it: refresh under the lock instead
         if (exp !== null && c.expiresAt === exp && exp - Date.now() > margin) {
           this.cachedIdToken = c.idToken as string;
           this.tokenExpiry = exp - margin;
@@ -377,22 +380,26 @@ export class WorkflowBuilderClient {
   }
 
   /** After GHL rejects a token: forget it here and remove it from the shared cache if still current. */
+  /**
+   * GHL returned 401 for a request carrying this ID token. Stop using it in this process. The shared
+   * cache is never written here (that raced newer tokens): the next call skips the rejected entry,
+   * takes the refresh lock, re-reads the cache under it, and refreshes only if the cache still holds
+   * the rejected token, so one refresh replaces it for every lane.
+   * A token rejected within a minute of being minted points at another cause (usually the private
+   * integration token), so it is kept and the error surfaces instead of turning into a refresh storm.
+   */
   private kcInvalidateToken(rejected: string): void {
+    const iat = kcJwtIat(rejected);
+    if (iat !== null && Date.now() - iat < KC_FRESH_TOKEN_MS) {
+      process.stderr.write('[KC GHL] 401 with a token minted under a minute ago; not refreshing (check the private integration token)\n');
+      return;
+    }
+    this.kcRejectedToken = rejected;
     if (this.cachedIdToken === rejected) {
       this.cachedIdToken = null;
       this.tokenExpiry = 0;
     }
-    const f = this.kcCacheFile;
-    if (!f) return;
-    try {
-      const c = JSON.parse(readFileSync(f, 'utf8')) as { idToken?: unknown };
-      if (c.idToken === rejected) {
-        const tmp = `${f}.${process.pid}.invalidate`;
-        writeFileSync(tmp, '{}', { mode: 0o600 });
-        renameSync(tmp, f);
-        process.stderr.write('[KC GHL] GHL rejected the cached token; cleared it for all lanes on this login\n');
-      }
-    } catch { /* nothing to clear */ }
+    process.stderr.write('[KC GHL] GHL rejected the ID token; the next call refreshes it under the shared lock\n');
   }
 
   /**

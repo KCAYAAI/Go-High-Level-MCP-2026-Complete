@@ -499,6 +499,22 @@ export function kcStashRotatedRefreshToken(cacheFile: string | null, token: stri
   }
 }
 
+/** `iat` (ms) of a 3-part JWT, or null if malformed. */
+export function kcJwtIat(token: unknown): number | null {
+  if (typeof token !== 'string') return null;
+  const parts = token.split('.');
+  if (parts.length !== 3 || parts.some((x) => !x)) return null;
+  try {
+    const claims = JSON.parse(Buffer.from(parts[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8')) as { iat?: unknown };
+    return typeof claims.iat === 'number' && Number.isFinite(claims.iat) ? claims.iat * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
+/** A token GHL rejected less than this long after it was minted points at another cause (e.g. the private integration). */
+export const KC_FRESH_TOKEN_MS = 60_000;
+
 /** `exp` (ms) of a 3-part JWT, or null if malformed. */
 export function kcJwtExp(token: unknown): number | null {
   if (typeof token !== 'string') return null;

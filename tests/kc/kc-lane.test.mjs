@@ -129,17 +129,43 @@ await test('rotated refresh token is handed to the keeper (0600 pending file), n
   assert.equal(statSync(pending).mode & 0o777, 0o600);
   unlinkSync(pending);
 });
-await test('a token GHL rejects (401) is cleared from memory and the shared cache', async () => {
-  await client().listWorkflows({ limit: 1 });
-  const cached = JSON.parse(readFileSync(cacheFile(), 'utf8')).idToken;
+const jwtAt = (iatSec) => `${b64({ alg: 'none' })}.${b64({ exp: Math.floor(Date.now() / 1000) + 3600, iat: iatSec, user_id: 'u' })}.sig`;
+const seedCache = (tok) => writeFileSync(cacheFile(), JSON.stringify({ idToken: tok, expiresAt: JSON.parse(Buffer.from(tok.split('.')[1], 'base64url')).exp * 1000 }));
+await test('401: the same client stops using the token and recovers with exactly one refresh; other lanes reuse it', async () => {
+  const old = jwtAt(Math.floor(Date.now() / 1000) - 600); seedCache(old);
+  const c = client();
   workflowStatus = 401;
-  try { await assert.rejects(() => client().listWorkflows({ limit: 1 }), /401/); } finally { workflowStatus = 200; }
-  assert.equal(readFileSync(cacheFile(), 'utf8'), '{}', 'rejected token removed');
+  try { await assert.rejects(() => c.listWorkflows({ limit: 1 }), /401/); } finally { workflowStatus = 200; }
+  assert.equal(JSON.parse(readFileSync(cacheFile(), 'utf8')).idToken, old, 'cache not written outside the lock');
   const before = firebaseCalls;
-  await client().listWorkflows({ limit: 1 });
-  assert.equal(firebaseCalls, before + 1, 'next call refreshes');
-  assert.notEqual(JSON.parse(readFileSync(cacheFile(), 'utf8')).idToken, undefined);
-  assert.ok(cached);
+  await c.listWorkflows({ limit: 1 });            // same client, same process
+  assert.equal(firebaseCalls, before + 1, 'one refresh');
+  const fresh = JSON.parse(readFileSync(cacheFile(), 'utf8')).idToken;
+  assert.notEqual(fresh, old, 'cache now holds the new token');
+  await client().listWorkflows({ limit: 1 });     // another lane on the same login
+  assert.equal(firebaseCalls, before + 1, 'no second refresh');
+});
+await test('401 never discards a newer token another lane already published', async () => {
+  const old = jwtAt(Math.floor(Date.now() / 1000) - 600); seedCache(old);
+  const c = client();
+  workflowStatus = 401;
+  try { await assert.rejects(() => c.listWorkflows({ limit: 1 }), /401/); } finally { workflowStatus = 200; }
+  const newer = jwtAt(Math.floor(Date.now() / 1000) - 5); seedCache(newer);   // another lane refreshed meanwhile
+  const before = firebaseCalls;
+  await c.listWorkflows({ limit: 1 });
+  assert.equal(firebaseCalls, before, 'uses the newer token, no refresh');
+  assert.equal(JSON.parse(readFileSync(cacheFile(), 'utf8')).idToken, newer, 'newer token kept');
+});
+await test('401 with a token minted under a minute ago does not refresh (cause is elsewhere; no storm)', async () => {
+  const brandNew = jwtAt(Math.floor(Date.now() / 1000) - 5); seedCache(brandNew);
+  const c = client();
+  const before = firebaseCalls;
+  workflowStatus = 401;
+  try {
+    for (let i = 0; i < 3; i++) await assert.rejects(() => c.listWorkflows({ limit: 1 }), /401/);
+  } finally { workflowStatus = 200; }
+  assert.equal(firebaseCalls, before, 'no refreshes');
+  assert.equal(JSON.parse(readFileSync(cacheFile(), 'utf8')).idToken, brandNew);
 });
 await test('429 backoff stops inside the auth budget and releases the lock', async () => {
   writeFileSync(cacheFile(), '{}'); firebaseMode = '429';
