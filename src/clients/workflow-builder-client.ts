@@ -14,7 +14,8 @@ import { resolve, join } from 'path';
 import {
   kcSleep, kcLaneMode, kcPinned, kcAssertId, kcAssertLocationAllowed, kcCheckCall, kcCheckWrite,
   kcRequestSignal, kcRemainingMs, kcClaimAbandonedLock, kcReleaseLock, kcHeldLocks, kcJwtExp,
-  KC_AUTH_BUDGET_MS, kcCredentialName, kcStashRotatedRefreshToken,
+  KC_AUTH_BUDGET_MS, kcCredentialName, kcStashRotatedRefreshToken, kcIsWrite, kcUnknownOutcome,
+  kcPlanRequests, KcPartialWriteError,
 } from '../kc/lane.js';
 
 // ─── Types ──────────────────────────────────────────────────
@@ -444,7 +445,16 @@ export class WorkflowBuilderClient {
     const opts: RequestInit = { method, headers, signal: kcRequestSignal() };
     if (body) opts.body = JSON.stringify(body);
 
-    const res = await fetch(url, opts);
+    let res: Response;
+    try {
+      res = await fetch(url, opts);
+    } catch (err) {
+      const name = (err as Error)?.name;
+      if (kcIsWrite(method) && (name === 'AbortError' || name === 'TimeoutError')) {
+        throw kcUnknownOutcome(method, 'workflow request');
+      }
+      throw err;
+    }
     if (res.status === 401 && headers['token-id']) this.kcInvalidateToken(headers['token-id']);
     const text = await res.text();
 
@@ -603,11 +613,22 @@ export class WorkflowBuilderClient {
    * Clone a workflow: GET → create new → PUT with same actions/triggers.
    */
   async cloneWorkflow(workflowId: string, newName?: string): Promise<WorkflowFull> {
+    kcAssertId('workflow ID', workflowId);
     const source = await this.getWorkflow(workflowId);
     const name = newName || `${source.name} (copy)`;
+    // Counted from the first write on: POST create, then GET + PUT actions.
+    kcPlanRequests('clone', 3);
 
     // Create empty workflow
     const { id: newId } = await this.createWorkflow(name);
+    try {
+      return await this.kcFinishClone(source, newId);
+    } catch (err) {
+      throw new KcPartialWriteError(newId, `creating the empty copy "${name}"`, 'copying the actions', err);
+    }
+  }
+
+  private async kcFinishClone(source: WorkflowFull, newId: string): Promise<WorkflowFull> {
 
     // Remap action IDs to new UUIDs
     const idMap = new Map<string, string>();

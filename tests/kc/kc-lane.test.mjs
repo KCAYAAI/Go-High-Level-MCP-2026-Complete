@@ -20,7 +20,7 @@ Object.assign(process.env, {
   GHL_LOCATION_ID: B, GHL_FIREBASE_API_KEY: 'web-key', GHL_FIREBASE_REFRESH_TOKEN: 'TEST_REFRESH', GHL_API_KEY: 'pit',
 });
 
-let firebaseCalls = 0, firebaseMode = 'ok', sent = [], workflowStatus = 200, workflowDelayMs = 0;
+let firebaseCalls = 0, firebaseMode = 'ok', sent = [], workflowStatus = 200, workflowDelayMs = 0, failMethod = null;
 globalThis.fetch = async (url, opts = {}) => {
   const u = String(url);
   if (u.includes('securetoken')) {
@@ -32,7 +32,8 @@ globalThis.fetch = async (url, opts = {}) => {
   }
   if (workflowDelayMs) await new Promise((r, j) => { const t = setTimeout(r, workflowDelayMs); opts.signal?.addEventListener('abort', () => { clearTimeout(t); j(opts.signal.reason); }); });
   sent.push({ url: u, method: opts.method });
-  return new Response(JSON.stringify({ rows: [], count: 0, _id: 'w1', name: 'w', workflowData: { templates: [] } }), { status: workflowStatus });
+  if (failMethod && opts.method === failMethod) return new Response(JSON.stringify({ message: 'boom' }), { status: 500 });
+  return new Response(JSON.stringify({ rows: [], count: 0, id: 'w1', _id: 'w1', name: 'w', version: 1, workflowData: { templates: [] } }), { status: workflowStatus });
 };
 
 const lane = await import('../../dist/kc/lane.js');
@@ -246,7 +247,78 @@ await test('agency lane (unpinned): one server reaches two accounts by locationI
     assert.deepEqual(sent.map((s) => new URL(s.url).pathname.split('/')[2]), [A, B, C3]);
     const bad = await tools.executeWorkflowBuilderTool('ghl_list_workflows_full', { limit: 1, locationId: '../x' });
     assert.match(JSON.stringify(bad), /KC lane guard/);
-  } finally { process.env.KC_GHL_PINNED_LOCATION = saved; }
+  } finally { process.env.KC_GHL_PINNED_LOCATION = saved; process.env.GHL_LOCATION_ID = B; }
+});
+
+// ── Multi-write tools report partial results truthfully
+const parse = (res) => JSON.parse(res.content[0].text);
+await test('create: if adding actions fails after the create, the result names the created workflow', async () => {
+  const tools = new WorkflowBuilderTools(); sent = []; failMethod = 'PUT';
+  try {
+    const res = await lane.kcRunToolCall('ghl_create_workflow', undefined, () =>
+      tools.executeWorkflowBuilderTool('ghl_create_workflow', { name: 'x', actions: [{ type: 'wait', name: 'w' }] }));
+    assert.equal(res.isError, true);
+    const body = parse(res);
+    assert.equal(body.partial, true); assert.equal(body.createdWorkflowId, 'w1');
+    assert.match(body.nextStep, /Do not create it again/);
+  } finally { failMethod = null; }
+  assert.equal(sent.filter((s) => s.method === 'POST').length, 1);
+});
+await test('create: not started when the call cannot fit all its writes; nothing sent', async () => {
+  const tools = new WorkflowBuilderTools(); sent = [];
+  await fakeClock(async () => {
+    await lane.kcRunToolCall('ghl_create_workflow', undefined, async () => {
+      await new Promise((r) => setTimeout(r, lane.KC_CALL_BUDGET_MS - 60_000)); // 60 s left < 77 s needed
+      const res = await tools.executeWorkflowBuilderTool('ghl_create_workflow', { name: 'x', actions: [{ type: 'wait', name: 'w' }] });
+      assert.match(res.content[0].text, /not started.*Nothing was sent/s);
+    });
+  });
+  assert.equal(sent.filter((s) => s.method !== 'GET').length, 0);
+});
+await test('create without actions needs only one write and still runs with 60 s left', async () => {
+  const tools = new WorkflowBuilderTools(); sent = [];
+  await fakeClock(async () => {
+    await lane.kcRunToolCall('ghl_create_workflow', undefined, async () => {
+      await new Promise((r) => setTimeout(r, lane.KC_CALL_BUDGET_MS - 60_000));
+      const res = await tools.executeWorkflowBuilderTool('ghl_create_workflow', { name: 'x' });
+      assert.ok(!res.isError, res.content[0].text);
+    });
+  });
+  assert.equal(sent.filter((s) => s.method === 'POST').length, 1);
+});
+await test('clone: if copying actions fails after the create, the result names the copy', async () => {
+  const tools = new WorkflowBuilderTools(); failMethod = 'PUT';
+  try {
+    const res = await lane.kcRunToolCall('ghl_clone_workflow', undefined, () =>
+      tools.executeWorkflowBuilderTool('ghl_clone_workflow', { workflowId: 'src1' }));
+    if (!res.content[0].text.startsWith('{')) throw new Error(res.content[0].text);
+    const body = parse(res);
+    assert.equal(body.partial, true); assert.equal(body.createdWorkflowId, 'w1'); assert.match(body.failed, /copying the actions/);
+  } finally { failMethod = null; }
+});
+await test('budget math: every multi-write tool can start at the beginning of a call', async () => {
+  // clone/create plan 3 requests from the first write (77 s). A fresh call (cached token) plus a
+  // 20 s source read must still fit; slower cases refuse cleanly before any write.
+  const needed = 2 * 25_000 + lane.KC_MIN_WRITE_WINDOW_MS;
+  assert.ok(lane.KC_CALL_BUDGET_MS >= needed + 20_000, `fresh call has ${lane.KC_CALL_BUDGET_MS} ms for ${needed} ms`);
+});
+await test('a write cut off in flight reports an unknown outcome, not "nothing changed"', async () => {
+  const ac = new AbortController(); workflowDelayMs = 5_000;
+  try {
+    await lane.kcRunToolCall('t', ac.signal, async () => {
+      const p = client().deleteWorkflow('w1');
+      setTimeout(() => ac.abort(), 30);
+      await assert.rejects(() => p, /was sent but did not finish.*may or may not have applied/s);
+    });
+  } finally { workflowDelayMs = 0; }
+});
+await test('write refusal says only that this request was not sent', async () => {
+  await fakeClock(async () => {
+    await lane.kcRunToolCall('t', undefined, async () => {
+      await new Promise((r) => setTimeout(r, lane.KC_CALL_BUDGET_MS - 10_000));
+      await assert.rejects(() => client().deleteWorkflow('w1'), (e) => /this DELETE request was not sent/.test(e.message) && !/nothing was changed/.test(e.message));
+    });
+  });
 });
 
 for (const r of results) console.log(r.join(' | '));

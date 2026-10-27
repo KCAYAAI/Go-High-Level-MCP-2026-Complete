@@ -120,6 +120,20 @@ await t('catalog missing, malformed, or too small: pinned lane fails closed', as
   } finally { lane.kcSetCatalogPathForTests(real); }
   sent = []; await ax.get(`/locations/${B}`); assert.equal(sent.length, 1, 'real catalog restored');
 });
+await t('guard refusals are reported as KC refusals, not "GHL API Error (500)"', async () => {
+  let msg = ''; try { await ax.get(`/locations/${A}`); } catch (e) { msg = e.message; }
+  assert.match(msg, /^KC lane guard/);
+});
+await t('a public write cut off in flight reports an unknown outcome', async () => {
+  const caller = new AbortController();
+  ax.defaults.adapter = (config) => new Promise((_, reject) => {
+    config.signal.addEventListener('abort', () => { const e = new Error('canceled'); e.code = 'ERR_CANCELED'; e.config = config; e.isAxiosError = true; reject(e); });
+    setTimeout(() => caller.abort(), 20);
+  });
+  try {
+    await assert.rejects(lane.kcRunToolCall('t', caller.signal, () => ax.post('/contacts/', { locationId: B })), /was sent but did not finish.*may or may not have applied/s);
+  } finally { ax.defaults.adapter = adapter; }
+});
 await t('agency lane (unpinned) allows any account', async () => {
   delete process.env.KC_GHL_PINNED_LOCATION; sent = [];
   try { await ax.get(`/locations/${A}`); assert.equal(sent.length, 1); } finally { process.env.KC_GHL_PINNED_LOCATION = B; }

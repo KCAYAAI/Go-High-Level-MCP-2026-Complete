@@ -63,12 +63,42 @@ export function kcCheckCall(what: string): void {
   if (Date.now() >= s.deadline) throw new Error(`KC lane: ${what} not sent, tool call time budget exhausted`);
 }
 
+export const kcIsWrite = (method: string): boolean => /^(POST|PUT|PATCH|DELETE)$/i.test(method);
+
 /** Refuse to start a write that could still be running when the caller times out. */
 export function kcCheckWrite(method: string): void {
-  if (!/^(POST|PUT|PATCH|DELETE)$/i.test(method)) return;
+  if (!kcIsWrite(method)) return;
   kcCheckCall(`${method.toUpperCase()} request`);
   if (kcRemainingMs() < KC_MIN_WRITE_WINDOW_MS) {
-    throw new Error(`KC lane: ${method.toUpperCase()} request not sent, too little time left in this tool call; nothing was changed`);
+    throw new Error(`KC lane: this ${method.toUpperCase()} request was not sent (too little time left in this tool call)`);
+  }
+}
+
+/**
+ * Right before the first write of a multi-step operation: refuse to start unless there is time for
+ * every request from that write on (reads before the first write are not counted) (each bounded by KC_REQUEST_TIMEOUT_MS, the last write needing the full
+ * write window). Prevents half-finished creates when auth already used most of the call.
+ */
+export function kcPlanRequests(operation: string, requests: number): void {
+  const s = kcCall.getStore();
+  if (!s) return;
+  kcCheckCall(operation);
+  const needed = (requests - 1) * KC_REQUEST_TIMEOUT_MS + KC_MIN_WRITE_WINDOW_MS;
+  if (kcRemainingMs() < needed) {
+    throw new Error(`KC lane: ${operation} not started; not enough time left in this tool call for its ${requests} requests. Nothing was sent; it is safe to retry.`);
+  }
+}
+
+/** Error for a write that was dispatched but did not finish: GHL may or may not have applied it. */
+export function kcUnknownOutcome(method: string, what: string): Error {
+  return new Error(`KC lane: ${method.toUpperCase()} ${what} was sent but did not finish in time; GHL may or may not have applied it. Check the current state before retrying.`);
+}
+
+/** A multi-step operation that created something before a later step failed. */
+export class KcPartialWriteError extends Error {
+  constructor(public readonly createdId: string, public readonly completed: string, public readonly failedStep: string, cause: unknown) {
+    super(`${failedStep} failed after ${completed} (id ${createdId}): ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = 'KcPartialWriteError';
   }
 }
 

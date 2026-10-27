@@ -19,6 +19,28 @@ import {
   WorkflowTrigger,
 } from '../clients/workflow-builder-client.js';
 
+import { kcPlanRequests, KcPartialWriteError } from '../kc/lane.js';
+
+/** Tool result for a multi-step write that created something and then failed: name it, never hide it. */
+function kcPartialResult(err: KcPartialWriteError, c: WorkflowBuilderClient): ToolResult {
+  return {
+    content: [{
+      type: 'text',
+      text: JSON.stringify({
+        success: false,
+        partial: true,
+        createdWorkflowId: err.createdId,
+        completed: err.completed,
+        failed: err.failedStep,
+        error: err.message,
+        url: `https://app.gohighlevel.com/v2/location/${c.getLocationId()}/automation/workflow/${err.createdId}`,
+        nextStep: `Do not create it again. Finish it with ghl_update_workflow_actions on workflowId ${err.createdId}, or delete it with ghl_delete_workflow_internal.`,
+      }, null, 2),
+    }],
+    isError: true,
+  };
+}
+
 // ─── Tool result type ───────────────────────────────────────
 
 interface ToolResult {
@@ -360,13 +382,27 @@ export class WorkflowBuilderTools {
     const name = params.name as string;
     if (!name) return error('name is required');
 
-    // Step 1: Create empty workflow
-    const { id } = await c.createWorkflow(name);
-
-    // Step 2: Add actions if provided
     const rawActions = params.actions as WorkflowAction[] | undefined;
     const trigger = params.trigger as WorkflowTrigger | undefined;
     const publish = params.publish as boolean | undefined;
+    const needsUpdate = !!(rawActions?.length || trigger || publish);
+    // KC lanes: do not start unless every write fits in this tool call.
+    kcPlanRequests('create workflow', needsUpdate ? 3 : 1);
+
+    // Step 1: Create empty workflow
+    const { id } = await c.createWorkflow(name);
+    try {
+      return await this.finishCreateWorkflow(c, id, name, rawActions, trigger, publish);
+    } catch (err) {
+      return kcPartialResult(new KcPartialWriteError(id, `creating the empty workflow "${name}"`, 'a later step (adding actions, trigger, publish, or reading it back)', err), c);
+    }
+  }
+
+  private async finishCreateWorkflow(
+    c: WorkflowBuilderClient, id: string, name: string,
+    rawActions: WorkflowAction[] | undefined, trigger: WorkflowTrigger | undefined, publish: boolean | undefined,
+  ): Promise<ToolResult> {
+    // Step 2: Add actions if provided
 
     if (rawActions?.length || trigger) {
       await c.updateWorkflow(id, {
@@ -500,7 +536,13 @@ export class WorkflowBuilderTools {
     if (!workflowId) return error('workflowId is required');
 
     const newName = params.newName as string | undefined;
-    const workflow = await c.cloneWorkflow(workflowId, newName);
+    let workflow;
+    try {
+      workflow = await c.cloneWorkflow(workflowId, newName);
+    } catch (err) {
+      if (err instanceof KcPartialWriteError) return kcPartialResult(err, c);
+      throw err;
+    }
 
     return success({
       message: `Workflow cloned as "${workflow.name}"`,

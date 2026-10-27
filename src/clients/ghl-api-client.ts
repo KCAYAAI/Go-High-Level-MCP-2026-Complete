@@ -385,7 +385,7 @@ import {
 } from '../types/ghl-types.js';
 import { resolveVersion } from './version-router.js';
 import { resolveRequestVersion } from './endpoint-version-resolver.js';
-import { kcAssertPublicRequest, kcCheckCall, kcCheckWrite, kcRequestSignal, kcLaneMode } from '../kc/lane.js';
+import { kcAssertPublicRequest, kcCheckCall, kcCheckWrite, kcRequestSignal, kcLaneMode, kcIsWrite, kcUnknownOutcome } from '../kc/lane.js';
 
 /**
  * GoHighLevel API Client
@@ -473,6 +473,14 @@ export class GHLApiClient {
    * Handle API errors and convert to standardized format
    */
   private handleApiError(error: AxiosError<GHLErrorResponse>): Error {
+    if (kcLaneMode() && !error.response) {
+      // KC lane: guard refusals are not GHL errors, and a write cut off in flight has an unknown outcome.
+      if (typeof error.message === 'string' && error.message.startsWith('KC lane')) return new Error(error.message);
+      const method = String(error.config?.method || 'get');
+      if (kcIsWrite(method) && ['ERR_CANCELED', 'ECONNABORTED', 'ETIMEDOUT'].includes(String(error.code))) {
+        return kcUnknownOutcome(method, String(error.config?.url || 'request'));
+      }
+    }
     const status = error.response?.status || 500;
     const message = error.response?.data?.message || error.message || 'Unknown error';
     const errorMessage = Array.isArray(message) ? message.join(', ') : message;
