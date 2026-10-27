@@ -3,6 +3,27 @@
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { appendFileSync as kcAppend, mkdirSync as kcMkdir } from 'fs';
+import { dirname as kcDirname } from 'path';
+
+// KC audit log: one line per tool call. Records who called which lane, never arguments or results.
+function kcAudit(tool: string, ok: boolean, ms: number): void {
+  const file = process.env.KC_GHL_AUDIT_LOG;
+  if (!file) return;
+  try {
+    kcMkdir(kcDirname(file), { recursive: true, mode: 0o700 });
+    kcAppend(file, JSON.stringify({
+      ts: new Date().toISOString(),
+      caller: process.env.KC_GHL_CALLER || 'unknown',
+      lane: process.env.KC_GHL_LANE || 'unknown',
+      tool,
+      ok,
+      ms,
+    }) + '\n', { mode: 0o600 });
+  } catch {
+    // auditing must never break a tool call
+  }
+}
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
   CallToolRequestSchema,
@@ -72,6 +93,8 @@ class GHLMCPServer {
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
       process.stderr.write(`[GHL MCP] Executing tool: ${name}\n`);
+      const kcStarted = Date.now();
+      let kcOk = false;
 
       try {
         const result = await this.registry.callTool(name, args || {});
@@ -79,6 +102,7 @@ class GHLMCPServer {
           throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
         }
 
+        kcOk = true;
         return {
           content: [{
             type: 'text',
@@ -90,6 +114,8 @@ class GHLMCPServer {
         const message = error instanceof Error ? error.message : String(error);
         const code = message.includes('404') ? ErrorCode.InvalidRequest : ErrorCode.InternalError;
         throw new McpError(code, `Tool execution failed: ${message}`);
+      } finally {
+        kcAudit(name, kcOk, Date.now() - kcStarted);
       }
     });
   }
