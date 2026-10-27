@@ -385,7 +385,7 @@ import {
 } from '../types/ghl-types.js';
 import { resolveVersion } from './version-router.js';
 import { resolveRequestVersion } from './endpoint-version-resolver.js';
-import { kcAssertPublicRequest, kcCheckCall, kcCheckWrite, kcRequestSignal, kcLaneMode, kcIsWrite, kcUnknownOutcome, kcAgencyTokenFor, kcPinned, kcTargetLocation } from '../kc/lane.js';
+import { kcAssertPublicRequest, kcAssertApiHost, kcCheckCall, kcCheckWrite, kcRequestSignal, kcLaneMode, kcIsWrite, kcUnknownOutcome, kcAgencyTokenFor, kcPinned, kcTargetLocation } from '../kc/lane.js';
 
 /**
  * GoHighLevel API Client
@@ -432,6 +432,7 @@ export class GHLApiClient {
       (config) => {
         if (kcLaneMode()) {
           // KC lanes: refuse other accounts on the final URL axios will send, and keep inside the call deadline.
+          kcAssertApiHost(String(config.url || ''), this.axiosInstance.getUri(config), this.config.baseUrl);
           kcAssertPublicRequest(String(config.url || ''), this.axiosInstance.getUri(config), config.data, this.config.baseUrl);
           // Agency lane: send sub-account requests with that sub-account's own token.
           const routed = kcAgencyTokenFor(String(config.url || ''), this.axiosInstance.getUri(config), config.data, this.config.baseUrl);

@@ -51,6 +51,12 @@ await t('workflow tool schemas carry no KC locationId outside a lane', async () 
   assert.equal(tools.length, 7);
   assert.ok(tools.every((x) => !('locationId' in (x.inputSchema.properties || {}))));
 });
+await t('R5: workflow tool schemas outside a lane match upstream exactly (no locationId in properties or required)', async () => {
+  const { WorkflowBuilderTools } = await import('../../dist/tools/workflow-builder-tools.js');
+  for (const x of new WorkflowBuilderTools().getTools()) {
+    assert.ok(!(x.inputSchema.required || []).includes('locationId'), x.name);
+  }
+});
 await t('no KC audit file is written', () => assert.equal(existsSync(process.env.KC_GHL_AUDIT_LOG), false));
 
 for (const r of results) console.log(r.join(' | '));

@@ -110,6 +110,19 @@ await t('F2 (agency): absolute URL to another host is refused', async () => {
   await assert.rejects(ax.get('https://attacker.example/contacts/', { params: { locationId: A } }), /host other than the GHL API/);
   assert.equal(sent.length, 0);
 });
+await t('R5: unpinned lane with an EMPTY token map still pins the API host and refuses unregistered targets', async () => {
+  const saved = process.env.KC_GHL_LOCATION_TOKENS; process.env.KC_GHL_LOCATION_TOKENS = '{}'; lane.kcResetLocationTokensForTests?.();
+  try {
+    await assert.rejects(ax.get('https://attacker.example/contacts/'), /host other than the GHL API/);
+    assert.equal(sent.length, 0);
+    assert.throws(() => lane.kcSplitLocationArg({ locationId: A }, false), /not registered in this lane/);
+    assert.equal(lane.kcSplitLocationArg({ locationId: B }, false).location, B, 'lane default is always allowed');
+  } finally { process.env.KC_GHL_LOCATION_TOKENS = saved; lane.kcResetLocationTokensForTests?.(); }
+});
+await t('R5: lane mode without a base URL refuses instead of failing open', () => {
+  assert.throws(() => lane.kcAssertApiHost('https://x.example/a', 'https://x.example/a', undefined), /base URL unknown/);
+  assert.throws(() => lane.kcAssertApiHost('/contacts/', 'https://x.example/contacts/', ''), /base URL unknown/);
+});
 await t('outside a KC lane nothing is routed', async () => {
   delete process.env.KC_GHL_LANE;
   try { await ax.get('/contacts/', { params: { locationId: A } }); assert.equal(auth(), 'Bearer tok-AGENCY'); } finally { process.env.KC_GHL_LANE = 'agency_test'; }

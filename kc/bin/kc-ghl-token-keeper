@@ -20,7 +20,7 @@ failures, and on recovery.
   kc-ghl-token-keeper --status   show login health
   kc-ghl-token-keeper --force    refresh even if the cached token is fresh
 """
-import argparse, base64, errno, hashlib, json, os, socket, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
+import argparse, base64, errno, fcntl, hashlib, json, os, socket, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
 from datetime import datetime, timezone
 
 REGISTRY = os.environ.get('KC_GHL_REGISTRY', '/home/aya/.local/share/kc-ghl/lanes.json')
@@ -250,7 +250,9 @@ def registry_problem(reg):
     if not isinstance(reg.get('lanes'), dict):
         return 'lanes must be an object'
     for name, lane in reg['lanes'].items():
-        if not isinstance(lane, dict) or lane.get('pending'):
+        if not isinstance(lane, dict):
+            return f'lane {name} must be an object'
+        if lane.get('pending'):
             continue
         s = lane.get('secrets')
         if not isinstance(s, dict):
@@ -303,19 +305,31 @@ def main():
     ap.add_argument('--status', action='store_true')
     ap.add_argument('--force', action='store_true')
     a = ap.parse_args()
+    marker = REGISTRY + '.keeper-alerted'
     try:
         reg = read_json(REGISTRY)
         problem = registry_problem(reg)
+        logins = [] if problem else logins_from_registry(reg)
     except Exception as e:
-        reg, problem = None, f'cannot read registry ({type(e).__name__})'
+        reg, problem, logins = None, f'cannot read registry ({type(e).__name__})', []
     if problem:
         log(f'registry invalid: {problem}')
-        if not a.status:
-            slack(f':rotating_light: GHL token keeper cannot run: lane registry invalid ({problem}). Check `kc-ghl --list`.')
+        if not a.status and read_or_empty(marker) != problem:   # one alert per distinct problem
+            if slack(f':rotating_light: GHL token keeper cannot run: lane registry invalid ({problem}). Check `kc-ghl --list`.'):
+                write_atomic(marker, problem)
         return 2
+    if os.path.exists(marker):
+        os.unlink(marker)
     cache_dir = reg['token_cache_dir']
     os.makedirs(cache_dir, mode=0o700, exist_ok=True)
     status_file = os.path.join(cache_dir, 'keeper-status.json')
+    if not a.status:
+        run_lock = open(os.path.join(cache_dir, 'keeper.run.lock'), 'a')
+        try:
+            fcntl.flock(run_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            log('another keeper run is in progress; skipping')
+            return 0
     try:
         status = read_json(status_file)
     except Exception:
@@ -326,14 +340,16 @@ def main():
                   f"last rotation {s.get('last_rotation', '-')} | {s.get('last_error', '')}")
         return 0
     failed = 0
-    for login in logins_from_registry(reg):
+    for login in logins:
         cred = login['credential']
         s = status.setdefault(cred, {'failures': 0})
         try:
             result = keep_login(login, cache_dir, a.force)
             s.update(state='ok', failures=0, last_ok=now(), last_error='')
-            if s.get('alerted') and slack(f":white_check_mark: GHL login `{cred}` is healthy again (lanes: {', '.join(login['lanes'])})."):
-                s['alerted'] = False  # recovery notice delivered; otherwise retried next run
+            if s.pop('alerted', False):
+                s['recovery_pending'] = True              # incident over; its recovery notice is owed
+            if s.get('recovery_pending') and slack(f":white_check_mark: GHL login `{cred}` is healthy again (lanes: {', '.join(login['lanes'])})."):
+                s['recovery_pending'] = False             # otherwise retried next healthy run
             if 'rotated' in result:
                 s['last_rotation'] = now()
             log(f'{cred} | {result}')
@@ -343,6 +359,7 @@ def main():
             s.update(state='dead' if dead else 'retrying', failures=s.get('failures', 0) + 1,
                      last_error=f'{type(e).__name__}: {e}', last_failure=now())
             log(f'{cred} | FAILED ({s["failures"]}) | {s["last_error"]}')
+            s.pop('recovery_pending', None)              # a new failure supersedes an undelivered recovery notice
             if not s.get('alerted') and (dead or s['failures'] >= ALERT_AFTER_FAILURES):
                 if slack(f":rotating_light: GHL login `{cred}` {'is dead and needs a new login' if dead else 'keeps failing to refresh'}"
                          f" — {e}. Lanes affected: {', '.join(login['lanes'])}. Check: `kc-ghl-token-keeper --status`."):

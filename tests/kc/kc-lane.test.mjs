@@ -247,6 +247,20 @@ await test('F4: a write whose response body stalls after the headers reports an 
   finally { globalThis.fetch = realFetch; }
 });
 
+await test('R5: a write whose body fails with a connection reset after headers reports an unknown outcome', async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts = {}) => {
+    if (String(url).includes('securetoken')) return realFetch(url, opts);
+    if (opts.method === 'DELETE') {
+      const body = new ReadableStream({ start(c) { setTimeout(() => c.error(Object.assign(new TypeError('terminated'), { cause: { code: 'ECONNRESET' } })), 10); } });
+      return new Response(body, { status: 200 });
+    }
+    return realFetch(url, opts);
+  };
+  try { await assert.rejects(() => client().deleteWorkflow('w1'), /may or may not have applied/s); }
+  finally { globalThis.fetch = realFetch; }
+});
+
 // ── Per-call deadline and cancellation (whole tool call, not one request)
 await test('a write is not sent when too little call time remains; nothing changes', async () => {
   sent = [];

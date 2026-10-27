@@ -71,7 +71,7 @@ export function kcSplitLocationArg(args: Record<string, unknown>, nativeLocation
   kcAssertLocationAllowed(raw);
   if (kcLaneMode() && !kcPinned()) {
     const tokens = kcLocationTokens();
-    if (tokens.size > 0 && raw !== process.env.GHL_LOCATION_ID && !tokens.has(raw)) {
+    if (raw !== process.env.GHL_LOCATION_ID && !tokens.has(raw)) {
       throw new Error(`KC agency lane: sub-account ${raw} is not registered in this lane (add it with kc-ghl --add-subaccount)`);
     }
   }
@@ -317,12 +317,19 @@ function kcCollectBodyLocations(data: unknown, out: unknown[], depth = 0): void 
   }
 }
 
+/** Every KC lane request: the final URL must be on the configured API host and have a safe path. */
+export function kcAssertApiHost(rawUrl: string, fullUrl: string, baseUrl: string | undefined): void {
+  if (!kcLaneMode()) return;
+  kcSafeUrl(rawUrl, fullUrl, baseUrl);
+}
+
 /** Parse the final URL after refusing traversal, encoding, backslashes, dot/empty segments, control characters. */
 function kcSafeUrl(rawUrl: string, fullUrl: string, baseUrl?: string): URL {
   const unsafe = () => { throw new Error('KC lane guard: blocked a public API request with an unsafe path'); };
-  if (baseUrl) {
+  if (baseUrl || kcLaneMode()) {
     // Tokens only ever go to the configured API host; an absolute URL to anywhere else is refused.
-    const origin = new URL(baseUrl).origin;
+    let origin: string;
+    try { origin = new URL(String(baseUrl)).origin; } catch { throw new Error('KC lane guard: API base URL unknown; refused'); }
     if (/^[a-z][a-z0-9+.-]*:/i.test(rawUrl) && !rawUrl.toLowerCase().startsWith(origin.toLowerCase() + '/')) {
       throw new Error('KC lane guard: blocked a public API request to a host other than the GHL API');
     }

@@ -220,6 +220,40 @@ class KeeperTest(unittest.TestCase):
         self.assertEqual(self.run_keeper(), 2)
         self.assertEqual(len(alerts), 1); self.assertIn('token_cache_dir', alerts[0])
 
+    def test_failed_recovery_notice_does_not_suppress_next_incident(self):
+        self.k.vault_set('T_RT', 'X'); Firebase.DEAD = {'X'}
+        posts = []; ok = {'v': True}
+        self.k.slack = lambda text: (posts.append(text), ok['v'])[1]
+        self.run_keeper()                                   # dead -> incident alert delivered
+        self.assertEqual(len(posts), 1)
+        Firebase.DEAD = set(); ok['v'] = False
+        self.run_keeper('--force')                          # healthy, recovery post fails
+        self.assertTrue(self.status().get('recovery_pending'))
+        Firebase.DEAD = {'X'}; ok['v'] = True
+        self.run_keeper('--force')                          # new incident must alert
+        self.assertIn('rotating_light', posts[-1])
+        self.assertTrue(self.status().get('alerted'))
+
+    def test_null_lane_entry_is_a_registry_problem(self):
+        reg = json.load(open(os.environ['KC_GHL_REGISTRY'])); reg['lanes']['broken'] = None
+        json.dump(reg, open(os.environ['KC_GHL_REGISTRY'], 'w'))
+        alerts = []; self.k.slack = lambda text: (alerts.append(text), True)[1]
+        self.assertEqual(self.run_keeper(), 2)
+        self.assertEqual(self.run_keeper(), 2)
+        self.assertEqual(len(alerts), 1, 'one alert per distinct registry problem')
+        self.assertIn('broken', alerts[0])
+
+    def test_second_keeper_run_is_skipped_while_one_runs(self):
+        import fcntl
+        self.k.vault_set('T_RT', 'S'); self.run_keeper()
+        held = open(os.path.join(self.cache, 'keeper.run.lock'), 'a'); fcntl.flock(held, fcntl.LOCK_EX)
+        try:
+            n = len(Firebase.CALLS)
+            self.assertEqual(self.run_keeper('--force'), 0)
+            self.assertEqual(len(Firebase.CALLS), n)
+        finally:
+            held.close()
+
     def _cid(self):
         cache = [f for f in self.files('.json') if not f.endswith('keeper-status.json')][0]
         return os.path.basename(cache)[:-5]

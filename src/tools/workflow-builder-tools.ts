@@ -27,7 +27,10 @@ function kcStripLocationArg(tool: Tool): Tool {
   const schema = tool.inputSchema as { properties?: Record<string, unknown> };
   if (!schema?.properties || !('locationId' in schema.properties)) return tool;
   const { locationId: _drop, ...properties } = schema.properties;
-  return { ...tool, inputSchema: { ...tool.inputSchema, properties } as Tool['inputSchema'] };
+  const req = (tool.inputSchema as { required?: string[] }).required;
+  const inputSchema = { ...tool.inputSchema, properties } as Tool['inputSchema'] & { required?: string[] };
+  if (Array.isArray(req)) inputSchema.required = req.filter((r) => r !== 'locationId');
+  return { ...tool, inputSchema };
 }
 
 function kcPartialResult(err: KcPartialWriteError, c: WorkflowBuilderClient): ToolResult {

@@ -159,8 +159,10 @@ def add_subaccount(reg, lane_name, loc, key, replace=False):
         s2 = ghl_get_conclusive(token, f'/contacts/?locationId={other}&limit=1')
         if s2 == 200:
             fail(f'token in {key} can also read sub-account {other}; expected a sub-account-scoped private integration')
+        if s2 in (0, 429) or s2 >= 500:
+            fail(f'could not confirm {key} is denied in sub-account {other} (HTTP {s2 or "network error"}); try again later')
         if s2 not in (401, 403):
-            fail(f'could not confirm {key} is denied in sub-account {other} (HTTP {s2}); try again later')
+            fail(f'HTTP {s2} from sub-account {other} is not a denial; registration refused')
     current = lane.get('location_tokens') or {}
     if current.get(loc) == key:
         print(f'already registered | {loc} ({name}) -> {key}')

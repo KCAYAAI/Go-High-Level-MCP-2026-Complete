@@ -86,8 +86,13 @@ export interface WorkflowBuilderConfig {
 
 // ─── Client ─────────────────────────────────────────────────
 
-/** ID tokens GHL rejected (401) in this process; never reused from the shared cache. */
-const KC_REJECTED_TOKENS = new Set<string>();
+/** ID tokens GHL rejected (401) in this process, with expiry (ms); never reused from the shared cache. */
+const KC_REJECTED_TOKENS = new Map<string, number>();
+function kcRememberRejected(token: string): void {
+  const now = Date.now();
+  for (const [t, exp] of KC_REJECTED_TOKENS) if (exp <= now) KC_REJECTED_TOKENS.delete(t);
+  KC_REJECTED_TOKENS.set(token, kcJwtExp(token) ?? now + 3_600_000);
+}
 
 export class WorkflowBuilderClient {
   private config: WorkflowBuilderConfig;
@@ -401,7 +406,7 @@ export class WorkflowBuilderClient {
       process.stderr.write('[KC GHL] 401 with a token minted under a minute ago; not refreshing (check the private integration token)\n');
       return;
     }
-    KC_REJECTED_TOKENS.add(rejected); // shared by every client in this process (all sub-accounts, same login)
+    kcRememberRejected(rejected); // shared by every client in this process (all sub-accounts, same login)
     if (this.cachedIdToken === rejected) {
       this.cachedIdToken = null;
       this.tokenExpiry = 0;
@@ -506,11 +511,8 @@ export class WorkflowBuilderClient {
     try {
       text = await res.text();
     } catch (err) {
-      // Headers arrived, then the body stalled or was aborted: for a write, GHL may have applied it.
-      const name = (err as Error)?.name;
-      if (kcIsWrite(method) && (name === 'AbortError' || name === 'TimeoutError')) {
-        throw kcUnknownOutcome(method, 'workflow request');
-      }
+      // Headers arrived, so a write was dispatched; any body failure (abort, timeout, connection reset) means GHL may have applied it.
+      if (kcIsWrite(method)) throw kcUnknownOutcome(method, 'workflow request');
       throw err;
     }
 
