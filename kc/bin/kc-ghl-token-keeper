@@ -306,6 +306,15 @@ def main():
     ap.add_argument('--force', action='store_true')
     a = ap.parse_args()
     marker = REGISTRY + '.keeper-alerted'
+    if not a.status:
+        # One keeper run at a time (status file, registry alert marker). The lock sits next to the registry
+        # so it works even when the registry is invalid.
+        run_lock = open(REGISTRY + '.keeper.lock', 'a')
+        try:
+            fcntl.flock(run_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            log('another keeper run is in progress; skipping')
+            return 0
     try:
         reg = read_json(REGISTRY)
         problem = registry_problem(reg)
@@ -318,18 +327,14 @@ def main():
             if slack(f':rotating_light: GHL token keeper cannot run: lane registry invalid ({problem}). Check `kc-ghl --list`.'):
                 write_atomic(marker, problem)
         return 2
-    if os.path.exists(marker):
-        os.unlink(marker)
+    if not a.status:
+        try:
+            os.unlink(marker)
+        except FileNotFoundError:
+            pass
     cache_dir = reg['token_cache_dir']
     os.makedirs(cache_dir, mode=0o700, exist_ok=True)
     status_file = os.path.join(cache_dir, 'keeper-status.json')
-    if not a.status:
-        run_lock = open(os.path.join(cache_dir, 'keeper.run.lock'), 'a')
-        try:
-            fcntl.flock(run_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            log('another keeper run is in progress; skipping')
-            return 0
     try:
         status = read_json(status_file)
     except Exception:
@@ -356,6 +361,8 @@ def main():
         except Exception as e:  # one login's failure never stops the others or the status write
             failed += 1
             dead = isinstance(e, Dead)
+            if s.get('state') == 'ok':
+                s.pop('alerted', None)                   # healthy -> failed is a new incident (also migrates old status files)
             s.update(state='dead' if dead else 'retrying', failures=s.get('failures', 0) + 1,
                      last_error=f'{type(e).__name__}: {e}', last_failure=now())
             log(f'{cred} | FAILED ({s["failures"]}) | {s["last_error"]}')

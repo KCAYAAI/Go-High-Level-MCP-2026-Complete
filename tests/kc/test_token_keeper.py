@@ -246,13 +246,31 @@ class KeeperTest(unittest.TestCase):
     def test_second_keeper_run_is_skipped_while_one_runs(self):
         import fcntl
         self.k.vault_set('T_RT', 'S'); self.run_keeper()
-        held = open(os.path.join(self.cache, 'keeper.run.lock'), 'a'); fcntl.flock(held, fcntl.LOCK_EX)
+        held = open(os.environ['KC_GHL_REGISTRY'] + '.keeper.lock', 'a'); fcntl.flock(held, fcntl.LOCK_EX)
         try:
             n = len(Firebase.CALLS)
             self.assertEqual(self.run_keeper('--force'), 0)
             self.assertEqual(len(Firebase.CALLS), n)
         finally:
             held.close()
+
+    def test_old_status_healthy_but_alerted_still_alerts_new_incident(self):
+        self.k.vault_set('T_RT', 'S'); self.run_keeper()
+        st = json.load(open(os.path.join(self.cache, 'keeper-status.json')))
+        key = next(k for k in st if k.startswith('owner:'))
+        st[key].update(state='ok', alerted=True)          # format left by the previous keeper after a failed recovery post
+        json.dump(st, open(os.path.join(self.cache, 'keeper-status.json'), 'w'))
+        self.k.vault_set('T_RT', 'X'); Firebase.DEAD = {'X', 'S'}
+        posts = []; self.k.slack = lambda text: (posts.append(text), True)[1]
+        self.run_keeper('--force')
+        self.assertTrue(posts and 'rotating_light' in posts[-1], 'new incident alerted')
+
+    def test_registry_marker_cleared_once_valid_even_if_absent(self):
+        self.k.vault_set('T_RT', 'S')
+        self.assertEqual(self.run_keeper(), 0)            # no marker present: no error
+        open(os.environ['KC_GHL_REGISTRY'] + '.keeper-alerted', 'w').write('old problem')
+        self.assertEqual(self.run_keeper(), 0)
+        self.assertFalse(os.path.exists(os.environ['KC_GHL_REGISTRY'] + '.keeper-alerted'))
 
     def _cid(self):
         cache = [f for f in self.files('.json') if not f.endswith('keeper-status.json')][0]
