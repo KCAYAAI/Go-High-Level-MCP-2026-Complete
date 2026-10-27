@@ -424,7 +424,10 @@ export class GHLApiClient {
           kcAssertPublicRequest(String(config.url || ''), this.axiosInstance.getUri(config), config.data);
           kcCheckCall(`${(config.method || 'get').toUpperCase()} request`);
           kcCheckWrite(config.method || 'get');
-          if (!config.signal) config.signal = kcRequestSignal(30_000);
+          // Always bound by the call deadline and caller cancellation, even if the request brought its own signal.
+          config.signal = config.signal
+            ? AbortSignal.any([config.signal as AbortSignal, kcRequestSignal(30_000)])
+            : kcRequestSignal(30_000);
         }
         const requestFallback = typeof config.headers?.get === 'function'
           ? config.headers.get('Version')

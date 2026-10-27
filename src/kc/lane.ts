@@ -119,30 +119,88 @@ export function kcAssertLocationAllowed(locationId: string): void {
 }
 
 // ─── Public API guard ───────────────────────────────────────
-const KC_LOC_KEYS = new Set(['locationId', 'location_id', 'locationIds', 'share_location_id', 'shareLocationId']);
+const KC_LOC_KEYS = new Set(['locationid', 'location_id', 'locationids', 'share_location_id', 'sharelocationid']);
+/** The catalog has 58 location-scoped templates today; far fewer means it failed to load properly. */
+export const KC_MIN_CATALOG_TEMPLATES = 20;
 let kcLocPathTemplates: RegExp[] | null = null;
+let kcCatalogPath = join(__dirname, '..', 'tools', 'official-spec-endpoints.json');
 
-/** Regexes for every official endpoint path that carries a {locationId} segment. */
+/** Test hook: point the guard at a different catalog file and drop the cached templates. */
+export function kcSetCatalogPathForTests(path: string): void {
+  kcCatalogPath = path;
+  kcLocPathTemplates = null;
+}
+
+/**
+ * Regexes for every official endpoint path that carries a {locationId} segment, case-insensitive
+ * (GHL's router is). Fails closed: a pinned lane refuses public calls if the catalog is unreadable,
+ * malformed, or suspiciously small, instead of silently checking only /locations/<id>.
+ */
 function kcLocationPathTemplates(): RegExp[] {
   if (kcLocPathTemplates) return kcLocPathTemplates;
-  const out: RegExp[] = [/^\/locations\/([^/]+)(?:\/|$)/];
+  const out: RegExp[] = [/^\/locations\/([^/]+)(?:\/|$)/i];
+  let spec: unknown;
   try {
-    const spec = JSON.parse(readFileSync(join(__dirname, '..', 'tools', 'official-spec-endpoints.json'), 'utf8')) as { path?: string }[];
-    for (const e of spec) {
-      const p = e?.path;
-      if (!p || !/\{(locationId|location_id)\}/.test(p)) continue;
-      const parts = p.split('/').map((s) => {
-        if (s === '{locationId}' || s === '{location_id}') return '([^/]+)';
-        if (/^\{[^}]+\}$/.test(s)) return '[^/]+';
-        return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      });
-      out.push(new RegExp(`^${parts.join('/')}/?$`));
-    }
-  } catch {
-    // catalog missing: the generic /locations/<id> rule still applies
+    spec = JSON.parse(readFileSync(kcCatalogPath, 'utf8'));
+  } catch (e) {
+    throw new Error(`KC lane guard: endpoint catalog unreadable (${(e as Error).name}); public API calls are blocked in this lane`);
   }
+  if (!Array.isArray(spec)) throw new Error('KC lane guard: endpoint catalog malformed; public API calls are blocked in this lane');
+  for (const e of spec as { path?: unknown }[]) {
+    const p = e?.path;
+    if (typeof p !== 'string' || !/\{(locationId|location_id)\}/.test(p)) continue;
+    const parts = p.split('/').map((s) => {
+      if (s === '{locationId}' || s === '{location_id}') return '([^/]+)';
+      if (/^\{[^}]+\}$/.test(s)) return '[^/]+';
+      return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    });
+    out.push(new RegExp(`^${parts.join('/')}/?$`, 'i'));
+  }
+  if (out.length - 1 < KC_MIN_CATALOG_TEMPLATES) {
+    throw new Error(`KC lane guard: endpoint catalog has only ${out.length - 1} location templates; public API calls are blocked in this lane`);
+  }
+  process.stderr.write(`[KC GHL] public API guard loaded ${out.length - 1} location-scoped endpoint templates\n`);
   kcLocPathTemplates = out;
   return out;
+}
+
+/** True if a form/query key names a location: `locationId`, `locationIds[]`, `locationIds[0]`, `filter[locationId]`. */
+function kcIsLocationKey(key: string): boolean {
+  return key.toLowerCase().split(/[[\]]+/).some((part) => part !== '' && KC_LOC_KEYS.has(part));
+}
+
+function kcIsAltTypeKey(key: string): boolean {
+  return key.toLowerCase().split(/[[\]]+/).some((part) => part === 'alttype');
+}
+
+function kcIsAltIdKey(key: string): boolean {
+  return key.toLowerCase().split(/[[\]]+/).some((part) => part === 'altid');
+}
+
+/** Location values named in a flat key/value list (query string, form body, FormData). */
+function kcCollectPairs(pairs: Iterable<[string, unknown]>, out: unknown[]): void {
+  const list = [...pairs];
+  for (const [k, v] of list) if (kcIsLocationKey(k)) out.push(v);
+  if (list.some(([k, v]) => kcIsAltTypeKey(k) && String(v).toLowerCase() === 'location')) {
+    for (const [k, v] of list) if (kcIsAltIdKey(k)) out.push(v);
+  }
+}
+
+/**
+ * A path segment captured where a location belongs is acceptable only if it is the pin or a
+ * literal endpoint word (letters and hyphens, shorter than an ID, e.g. /locations/search).
+ * Anything else (another ID, an ID with junk appended) is treated as another account.
+ */
+function kcSegmentIsOtherAccount(seg: string, pin: string): boolean {
+  if (seg === pin) return false;
+  return seg.length >= 20 || !/^[A-Za-z-]+$/.test(seg);
+}
+
+/** All primitive values under a location key (arrays, objects, nested). */
+function kcCollectLeaves(v: unknown, out: unknown[], depth: number): void {
+  if (v === null || v === undefined || depth > 8) return;
+  if (typeof v !== 'object') { out.push(v); return; }
+  for (const x of Array.isArray(v) ? v : Object.values(v as Record<string, unknown>)) kcCollectLeaves(x, out, depth + 1);
 }
 
 /** Collect every location value named anywhere in a request body (any depth, any form). */
@@ -160,22 +218,22 @@ function kcCollectBodyLocations(data: unknown, out: unknown[], depth = 0): void 
   if (typeof data !== 'object') return;
   const d = data as { entries?: () => Iterable<[string, unknown]>; get?: unknown };
   if (typeof d.entries === 'function' && typeof d.get === 'function') { // URLSearchParams, FormData
-    const rec: Record<string, unknown[]> = {};
-    for (const [k, v] of d.entries()) (rec[k] ||= []).push(v);
-    for (const [k, vs] of Object.entries(rec)) if (KC_LOC_KEYS.has(k)) out.push(...vs);
-    if ((rec.altType || []).some((t) => String(t).toLowerCase() === 'location')) out.push(...(rec.altId || []));
+    kcCollectPairs(d.entries(), out);
     return;
   }
   if (Array.isArray(data)) { for (const x of data) kcCollectBodyLocations(x, out, depth + 1); return; }
   const r = data as Record<string, unknown>;
   for (const [k, v] of Object.entries(r)) {
-    if (KC_LOC_KEYS.has(k)) {
-      if (Array.isArray(v)) out.push(...v); else out.push(v);
+    if (kcIsLocationKey(k)) {
+      kcCollectLeaves(v, out, depth + 1); // every value under a location key counts, at any depth
     } else if (v && typeof v === 'object') {
       kcCollectBodyLocations(v, out, depth + 1);
     }
   }
-  if (typeof r.altType === 'string' && r.altType.toLowerCase() === 'location') out.push(r.altId);
+  const altType = Object.entries(r).find(([k]) => kcIsAltTypeKey(k))?.[1];
+  if (typeof altType === 'string' && altType.toLowerCase() === 'location') {
+    for (const [k, v] of Object.entries(r)) if (kcIsAltIdKey(k)) out.push(v);
+  }
 }
 
 /**
@@ -189,20 +247,19 @@ export function kcAssertPublicRequest(rawUrl: string, fullUrl: string, data: unk
   const pin = kcPinned();
   if (!pin) return;
   const block = () => { throw new Error("KC lane guard: blocked a public API request for a location outside this lane's account"); };
-  const rawPath = rawUrl.split('?')[0];
-  if (/\.\.|%|\\/i.test(rawPath)) {
-    throw new Error('KC lane guard: blocked a public API request with an unsafe path');
-  }
+  const unsafe = () => { throw new Error('KC lane guard: blocked a public API request with an unsafe path'); };
+  // Raw path (before the query): no traversal, encoding, backslashes, dot segments, or control characters.
+  const rawPath = rawUrl.split('?')[0].replace(/^[a-z]+:\/\/[^/]*/i, '');
+  if (/\.\.|%|\\|[\x00-\x1f\x7f]/.test(rawPath) || /(^|\/)\.(\/|$)/.test(rawPath) || rawPath.includes('//')) unsafe();
   const u = new URL(fullUrl);
+  // Final path: no empty segments (an edge server that merges slashes would see a different route).
+  if (u.pathname.includes('//')) unsafe();
   const named: unknown[] = [];
   for (const re of kcLocationPathTemplates()) {
     const m = u.pathname.match(re);
-    // GHL location IDs are 20 alphanumerics; literal segments like /locations/search are endpoints, not accounts.
-    if (m && /^[A-Za-z0-9]{20}$/.test(m[1])) named.push(m[1]);
+    if (m && kcSegmentIsOtherAccount(m[1], pin)) block();
   }
-  const q = u.searchParams;
-  for (const k of KC_LOC_KEYS) named.push(...q.getAll(k));
-  if (q.getAll('altType').some((t) => t.toLowerCase() === 'location')) named.push(...q.getAll('altId'));
+  kcCollectPairs(u.searchParams.entries(), named);
   kcCollectBodyLocations(data, named);
   for (const v of named) {
     if (v === undefined || v === null || v === '') continue;

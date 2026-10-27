@@ -8,7 +8,8 @@ const lane = await import('../../dist/kc/lane.js');
 const client = new GHLApiClient({ accessToken: 'pit', baseUrl: 'https://services.leadconnectorhq.com', version: '2021-07-28', locationId: B, apiGeneration: 'v3' });
 const ax = client.axiosInstance;
 let sent = [];
-ax.defaults.adapter = async (config) => { sent.push(config); return { data: {}, status: 200, statusText: 'OK', headers: {}, config }; };
+const adapter = async (config) => { sent.push(config); return { data: {}, status: 200, statusText: 'OK', headers: {}, config }; };
+ax.defaults.adapter = adapter;
 const results = [];
 const t = async (name, fn) => { try { await fn(); results.push(['PASS', name]); } catch (e) { results.push(['FAIL', name, e.message]); } };
 const blocked = async (p) => { sent = []; await assert.rejects(p, /KC lane guard/); assert.equal(sent.length, 0, 'nothing sent'); };
@@ -63,6 +64,61 @@ await t('public writes respect the call deadline', async () => {
     try { await assert.rejects(ax.post('/contacts/', { locationId: B }), /not sent/); } finally { Date.now = realNow; }
   });
   assert.equal(sent.length, 0);
+});
+await t('empty path segment /locations//<other>', () => blocked(ax.get(`/locations//${A}/customFields`)));
+await t('dot segment /locations/./<other>', () => blocked(ax.get(`/locations/./${A}`)));
+await t('upper-case /Locations/<other>', () => blocked(ax.get(`/Locations/${A}/customFields`)));
+await t('upper-case catalog path /Social-Media-Posting/<other>/categories', () => blocked(ax.get(`/Social-Media-Posting/${A}/categories`)));
+await t('other ID with junk appended /locations/<other>;x', () => blocked(ax.get(`/locations/${A};x`)));
+await t('tab inside the path', () => blocked(ax.get(`/loca\ttions/${A}`)));
+await t('array params serialize as locationId[]=', () => blocked(ax.get('/contacts/', { params: { locationId: [B, A] } })));
+await t('indexed query key locationIds[0]', () => blocked(ax.get(`/users/?locationIds[0]=${A}`)));
+await t('bracketed key filter[locationId]', () => blocked(ax.get(`/contacts/?filter[locationId]=${A}`)));
+await t('upper-case query key LocationId', () => blocked(ax.get(`/contacts/?LocationId=${A}`)));
+await t('bracketed form key locationIds[]', () => blocked(ax.post('/oauth/locationToken', `locationIds[]=${A}`)));
+await t('bracketed FormData key', async () => { const f = new FormData(); f.append('locationIds[]', A); await blocked(ax.post('/medias/upload-file', f)); });
+await t('nested object under a location key', () => blocked(ax.post('/x', { locationIds: { first: B, second: A } })));
+await t('own-account versions of the new shapes still pass', async () => {
+  sent = [];
+  await ax.get('/contacts/', { params: { locationId: [B] } });
+  await ax.get(`/users/?locationIds[0]=${B}`);
+  await ax.get(`/Locations/${B}`);
+  await ax.get('/locations/search', { params: { limit: 1 } });
+  assert.equal(sent.length, 4);
+});
+await t('a request with its own (non-aborted) signal still obeys caller cancellation', async () => {
+  const own = new AbortController(); const caller = new AbortController(); let seen;
+  ax.defaults.adapter = async (config) => { seen = config.signal; caller.abort(); return { data: {}, status: 200, statusText: 'OK', headers: {}, config }; };
+  try {
+    await assert.rejects(lane.kcRunToolCall('t', caller.signal, () => ax.get(`/locations/${B}`, { signal: own.signal })), /cancel/i);
+    assert.ok(seen && seen !== own.signal, 'signal was composed');
+    assert.equal(seen.aborted, true, 'caller cancel reaches the request');
+    assert.equal(own.signal.aborted, false);
+  } finally { ax.defaults.adapter = adapter; }
+});
+await t('tool level: OfficialSpecTools catalog endpoint for another account never reaches GHL', async () => {
+  const { OfficialSpecTools } = await import('../../dist/tools/official-spec-tools.js');
+  const tools = new OfficialSpecTools(client); sent = [];
+  let out; try { out = await tools.handleToolCall('official_social_media_posting_get_categories_location_id', { locationId: A }); } catch (e) { out = e; }
+  assert.match(String(out?.message ?? JSON.stringify(out)), /KC lane guard/);
+  assert.equal(sent.length, 0);
+  await tools.handleToolCall('official_social_media_posting_get_categories_location_id', { locationId: B });
+  assert.equal(sent.length, 1);
+});
+await t('catalog missing, malformed, or too small: pinned lane fails closed', async () => {
+  const { mkdtempSync, writeFileSync } = await import('node:fs'); const { join } = await import('node:path'); const { tmpdir } = await import('node:os');
+  const d = mkdtempSync(join(process.env.TMPDIR || tmpdir(), 'kc-cat-'));
+  const real = (await import('node:url')).fileURLToPath(new URL('../../dist/tools/official-spec-endpoints.json', import.meta.url));
+  try {
+    for (const [name, body] of [['missing.json', null], ['bad.json', '{not json'], ['obj.json', '{}'], ['small.json', JSON.stringify([{ path: '/x/{locationId}' }])]]) {
+      const f = join(d, name); if (body !== null) writeFileSync(f, body);
+      lane.kcSetCatalogPathForTests(f);
+      sent = [];
+      await assert.rejects(ax.get(`/locations/${B}`), /endpoint catalog/, name);
+      assert.equal(sent.length, 0, name);
+    }
+  } finally { lane.kcSetCatalogPathForTests(real); }
+  sent = []; await ax.get(`/locations/${B}`); assert.equal(sent.length, 1, 'real catalog restored');
 });
 await t('agency lane (unpinned) allows any account', async () => {
   delete process.env.KC_GHL_PINNED_LOCATION; sent = [];
