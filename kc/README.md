@@ -46,9 +46,28 @@ Outside a lane (no `KC_GHL_LANE`) the server behaves exactly like upstream.
   Caller cancellation aborts in-flight requests and blocks later writes.
 - **No ambient credentials.** In a lane the server skips `.env` loading and the legacy workflow-builder env file.
 
+## Token keeper (`kc/bin/kc-ghl-token-keeper`)
+
+The single writer for Firebase logins. A systemd user timer (`kc/systemd/`) runs it every 10 minutes.
+
+- Keeps at least 25 minutes of ID-token life in the shared cache, so lanes almost never refresh themselves.
+- Owns refresh-token rotation. Tries the newest token first (a lane's hand-off file, then the vault, then
+  `<KEY>_PREV`). If Firebase returns a new refresh token, it saves it to the 0600 hand-off file first, backs up
+  the old vault value to `<KEY>_PREV`, stores the new value, reads it back, then clears the hand-off file.
+- Lanes never write the vault. If a lane's own refresh returns a new token, the lane leaves it in the hand-off file.
+- `kc-secret set/unset` take an exclusive lock, so concurrent vault writes never lose an update.
+- Alerts Scout's Slack channel `KC_GHL_ALERT_CHANNEL` once when a login dies (all tokens rejected: log in again
+  and store a new refresh token) or fails 3 runs in a row, and once on recovery.
+- Logs show 8-character SHA-256 prefixes only, never token values.
+
+```bash
+kc-ghl-token-keeper --status                      # health per login
+systemctl --user list-timers kc-ghl-token-keeper.timer
+journalctl --user -u kc-ghl-token-keeper -n 20    # recent runs
+```
+
 Known limits (accepted): `--caller` is attribution, not authentication (all agents run as one OS user).
-Firebase refresh tokens are not rotated by Google in practice; if one is, the server logs a warning and keeps
-the vault value. A rare three-way race around an abandoned lock can cause one extra token refresh, never a wrong
+A rare three-way race around an abandoned lock can cause one extra token refresh, never a wrong
 account or corrupt cache.
 
 ## Test
