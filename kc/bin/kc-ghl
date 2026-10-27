@@ -63,6 +63,11 @@ def main():
         fail(f'unknown lane {a.lane}')
     if a.caller not in lane.get('callers', []):
         fail(f'caller {a.caller} is not approved for lane {a.lane}')
+    for key in ('location_id', 'user_id', 'company_id', 'credential_owner', 'secrets'):
+        if not lane.get(key):
+            fail(f'lane {a.lane} is missing {key} in the registry')
+    if not isinstance(lane.get('pinned', True), bool):
+        fail(f'lane {a.lane}: pinned must be true or false')
     if lane.get('pending'):
         fail(f"lane {a.lane} is not ready: {lane['pending']}")
 

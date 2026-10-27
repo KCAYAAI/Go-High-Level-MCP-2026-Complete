@@ -33,6 +33,22 @@ await t('other account in query string (location_id)', () => blocked(ax.get(`/op
 await t('other account in JSON body', () => blocked(ax.post('/contacts/', { locationId: A })));
 await t('other account in string body', () => blocked(ax.post('/contacts/', JSON.stringify({ locationId: A }))));
 await t('altId with altType=location', () => blocked(ax.get('/medias/files', { params: { altType: 'location', altId: A } })));
+await t('traversal via tool arg locationId "<own>/../<other>"', () => blocked(ax.get(`/locations/${B}/../${A}/customFields`)));
+await t('percent-encoded location ID in path', () => blocked(ax.get(`/locations/%41${A.slice(1)}/customFields`)));
+await t('location ID in a non-/locations path (catalog template)', () => blocked(ax.get(`/social-media-posting/${A}/categories`)));
+await t('locationIds array in body', () => blocked(ax.post('/users/', { locationIds: [B, A] })));
+await t('nested locationId in body', () => blocked(ax.post('/x/bulk', { contacts: [{ locationId: B }, { locationId: A }] })));
+await t('form-urlencoded string body', () => blocked(ax.post('/oauth/locationToken', `companyId=c&locationId=${A}`)));
+await t('URLSearchParams body', () => blocked(ax.post('/oauth/locationToken', new URLSearchParams({ locationId: A }))));
+await t('FormData altId/altType=location', async () => { const f = new FormData(); f.append('altType', 'location'); f.append('altId', A); await blocked(ax.post('/medias/upload-file', f)); });
+await t('own-account shapes of the same kinds still pass', async () => {
+  sent = [];
+  await ax.get(`/social-media-posting/${B}/categories`);
+  await ax.post('/users/', { locationIds: [B] });
+  await ax.post('/oauth/locationToken', `companyId=c&locationId=${B}`);
+  await ax.get('/contacts/', { params: { query: 'my flow #1 50%' } });
+  assert.equal(sent.length, 4);
+});
 await t('client method passing another locationId never reaches GHL', async () => {
   sent = [];
   let out; try { out = await client.searchContacts({ locationId: A, query: 'x', limit: 1 }); } catch (e) { out = e; }

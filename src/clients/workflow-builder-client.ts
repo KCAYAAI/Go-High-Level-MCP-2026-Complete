@@ -14,7 +14,7 @@ import { resolve, join } from 'path';
 import {
   kcSleep, kcLaneMode, kcPinned, kcAssertId, kcAssertLocationAllowed, kcCheckCall, kcCheckWrite,
   kcRequestSignal, kcRemainingMs, kcClaimAbandonedLock, kcReleaseLock, kcHeldLocks, kcJwtExp,
-  KC_AUTH_BUDGET_MS,
+  KC_AUTH_BUDGET_MS, kcCredentialName,
 } from '../kc/lane.js';
 
 // ─── Types ──────────────────────────────────────────────────
@@ -293,7 +293,7 @@ export class WorkflowBuilderClient {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     // Stable identity: the launcher's login name plus the public Firebase web key.
     // Never derived from the refresh token, so a rotation cannot split the cache.
-    const credential = process.env.KC_GHL_CREDENTIAL || 'unnamed';
+    const credential = kcCredentialName();
     const id = createHash('sha256').update(`${credential}:${this.config.firebaseApiKey}`).digest('hex').slice(0, 24);
     const cacheFile = join(dir, `${id}.json`);
     const lockFile = join(dir, `${id}.lock`);
@@ -424,7 +424,7 @@ export class WorkflowBuilderClient {
     body?: unknown
   ): Promise<{ status: number; data: T }> {
     // KC lane guard: reject path tricks, then check the URL fetch will actually send.
-    if (/\.\.|\\|%|#/.test(path)) {
+    if (/\.\.|\\|%|#/.test(path.split('?')[0])) {
       throw new Error('KC lane guard: blocked a workflow request with an unsafe path');
     }
     const url = new URL(`${WorkflowBuilderClient.BASE_URL}${path}`);

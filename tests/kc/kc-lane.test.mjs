@@ -60,6 +60,38 @@ await test('workflow ID traversal and delimiters are refused before any request'
 await test('raw request paths into another account are refused (canonical URL check)', async () => {
   for (const p of [`/${A}/list`, `/${B}/../${A}/list`, `/${B}x/list`, `/${A}`]) await assert.rejects(() => client().request('GET', p), /KC lane guard/, p);
 });
+await test('percent-encoded query values are allowed on workflow requests', async () => {
+  sent = [];
+  await client().request('GET', `/${B}/list?search=my%20flow%23&limit=1`);
+  assert.equal(sent.length, 1);
+});
+await test('lane mode refuses to run without a credential name (no shared "unnamed" cache)', async () => {
+  const saved = process.env.KC_GHL_CREDENTIAL; delete process.env.KC_GHL_CREDENTIAL;
+  writeFileSync(cacheFile(), '{}');
+  try { await assert.rejects(() => client().listWorkflows({ limit: 1 }), /KC_GHL_CREDENTIAL/); } finally { process.env.KC_GHL_CREDENTIAL = saved; }
+});
+await test('auth that would cross the call deadline stops instead of sleeping past it', async () => {
+  writeFileSync(cacheFile(), '{}'); firebaseMode = '429';
+  try {
+    await fakeClock(async () => {
+      await lane.kcRunToolCall('t', undefined, async () => {
+        await new Promise((r) => setTimeout(r, lane.KC_CALL_BUDGET_MS - 12_000)); // 12 s left: one 5 s backoff fits, 10 s does not
+        const t0 = Date.now();
+        await assert.rejects(() => client().listWorkflows({ limit: 1 }), /429|budget/);
+        assert.ok(Date.now() - t0 < 12_000, `stopped after ${Date.now() - t0} ms`);
+      });
+    });
+  } finally { firebaseMode = 'ok'; }
+});
+await test('release never deletes a lock now owned by someone else (same inode, other PID)', async () => {
+  const lock = cacheFile().replace('.json', '.lock');
+  writeFileSync(lock, String(process.ppid));
+  const { statSync } = await import('node:fs');
+  lane.kcHeldLocks.set(lock, statSync(lock).ino);
+  lane.kcReleaseLock(lock);
+  assert.ok(existsSync(lock));
+  (await import('node:fs')).unlinkSync(lock);
+});
 await test('own-account workflow calls work and stay in the pinned account', async () => {
   sent = [];
   await client().listWorkflows({ limit: 1 });

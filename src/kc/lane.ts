@@ -17,7 +17,7 @@ import { AsyncLocalStorage } from 'async_hooks';
 import {
   appendFileSync, mkdirSync, readFileSync, statSync, renameSync, linkSync, unlinkSync,
 } from 'fs';
-import { dirname } from 'path';
+import { dirname, join } from 'path';
 
 export const kcSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 export const kcLaneMode = (): boolean => !!process.env.KC_GHL_LANE;
@@ -119,7 +119,64 @@ export function kcAssertLocationAllowed(locationId: string): void {
 }
 
 // ─── Public API guard ───────────────────────────────────────
-const KC_LOC_PATH_RE = /\/locations\/([^/?#]+)/g;
+const KC_LOC_KEYS = new Set(['locationId', 'location_id', 'locationIds', 'share_location_id', 'shareLocationId']);
+let kcLocPathTemplates: RegExp[] | null = null;
+
+/** Regexes for every official endpoint path that carries a {locationId} segment. */
+function kcLocationPathTemplates(): RegExp[] {
+  if (kcLocPathTemplates) return kcLocPathTemplates;
+  const out: RegExp[] = [/^\/locations\/([^/]+)(?:\/|$)/];
+  try {
+    const spec = JSON.parse(readFileSync(join(__dirname, '..', 'tools', 'official-spec-endpoints.json'), 'utf8')) as { path?: string }[];
+    for (const e of spec) {
+      const p = e?.path;
+      if (!p || !/\{(locationId|location_id)\}/.test(p)) continue;
+      const parts = p.split('/').map((s) => {
+        if (s === '{locationId}' || s === '{location_id}') return '([^/]+)';
+        if (/^\{[^}]+\}$/.test(s)) return '[^/]+';
+        return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      });
+      out.push(new RegExp(`^${parts.join('/')}/?$`));
+    }
+  } catch {
+    // catalog missing: the generic /locations/<id> rule still applies
+  }
+  kcLocPathTemplates = out;
+  return out;
+}
+
+/** Collect every location value named anywhere in a request body (any depth, any form). */
+function kcCollectBodyLocations(data: unknown, out: unknown[], depth = 0): void {
+  if (data === undefined || data === null || depth > 8) return;
+  if (typeof data === 'string') {
+    const s = data.trim();
+    if (s.startsWith('{') || s.startsWith('[')) {
+      try { kcCollectBodyLocations(JSON.parse(s), out, depth + 1); } catch { /* not JSON */ }
+    } else if (s.includes('=')) {
+      kcCollectBodyLocations(new URLSearchParams(s), out, depth + 1);
+    }
+    return;
+  }
+  if (typeof data !== 'object') return;
+  const d = data as { entries?: () => Iterable<[string, unknown]>; get?: unknown };
+  if (typeof d.entries === 'function' && typeof d.get === 'function') { // URLSearchParams, FormData
+    const rec: Record<string, unknown[]> = {};
+    for (const [k, v] of d.entries()) (rec[k] ||= []).push(v);
+    for (const [k, vs] of Object.entries(rec)) if (KC_LOC_KEYS.has(k)) out.push(...vs);
+    if ((rec.altType || []).some((t) => String(t).toLowerCase() === 'location')) out.push(...(rec.altId || []));
+    return;
+  }
+  if (Array.isArray(data)) { for (const x of data) kcCollectBodyLocations(x, out, depth + 1); return; }
+  const r = data as Record<string, unknown>;
+  for (const [k, v] of Object.entries(r)) {
+    if (KC_LOC_KEYS.has(k)) {
+      if (Array.isArray(v)) out.push(...v); else out.push(v);
+    } else if (v && typeof v === 'object') {
+      kcCollectBodyLocations(v, out, depth + 1);
+    }
+  }
+  if (typeof r.altType === 'string' && r.altType.toLowerCase() === 'location') out.push(r.altId);
+}
 
 /**
  * Inside a pinned lane, every location named anywhere in a public API request must be
@@ -132,24 +189,21 @@ export function kcAssertPublicRequest(rawUrl: string, fullUrl: string, data: unk
   const pin = kcPinned();
   if (!pin) return;
   const block = () => { throw new Error("KC lane guard: blocked a public API request for a location outside this lane's account"); };
-  if (/\.\.|%2e|%2f|%5c|\\/i.test(rawUrl)) {
+  const rawPath = rawUrl.split('?')[0];
+  if (/\.\.|%|\\/i.test(rawPath)) {
     throw new Error('KC lane guard: blocked a public API request with an unsafe path');
   }
   const u = new URL(fullUrl);
-  for (const m of u.pathname.matchAll(KC_LOC_PATH_RE)) {
-    const seg = decodeURIComponent(m[1]);
-    if (/^[A-Za-z0-9]{20}$/.test(seg) && seg !== pin) block();
+  const named: unknown[] = [];
+  for (const re of kcLocationPathTemplates()) {
+    const m = u.pathname.match(re);
+    // GHL location IDs are 20 alphanumerics; literal segments like /locations/search are endpoints, not accounts.
+    if (m && /^[A-Za-z0-9]{20}$/.test(m[1])) named.push(m[1]);
   }
   const q = u.searchParams;
-  const named = [...q.getAll('locationId'), ...q.getAll('location_id')];
+  for (const k of KC_LOC_KEYS) named.push(...q.getAll(k));
   if (q.getAll('altType').some((t) => t.toLowerCase() === 'location')) named.push(...q.getAll('altId'));
-  let body: unknown = data;
-  if (typeof body === 'string') { try { body = JSON.parse(body); } catch { body = undefined; } }
-  if (body && typeof body === 'object' && !Array.isArray(body)) {
-    const r = body as Record<string, unknown>;
-    named.push(r.locationId as string, r.location_id as string);
-    if (typeof r.altType === 'string' && r.altType.toLowerCase() === 'location') named.push(r.altId as string);
-  }
+  kcCollectBodyLocations(data, named);
   for (const v of named) {
     if (v === undefined || v === null || v === '') continue;
     if (String(v) !== pin) block();
@@ -207,8 +261,16 @@ export function kcReleaseLock(lockFile: string): void {
   kcHeldLocks.delete(lockFile);
   if (ino === undefined) return;
   try {
-    if (statSync(lockFile).ino === ino) unlinkSync(lockFile); // never delete another holder's lock
+    // Never delete another holder's lock: inode and content (our PID) must both match.
+    if (statSync(lockFile).ino === ino && readFileSync(lockFile, 'utf8').trim() === String(process.pid)) unlinkSync(lockFile);
   } catch { /* already gone */ }
+}
+
+/** Cache identity for a lane's login. Required in lane mode so two logins can never share a cache. */
+export function kcCredentialName(): string {
+  const c = process.env.KC_GHL_CREDENTIAL;
+  if (kcLaneMode() && !c) throw new Error('KC token cache: KC_GHL_CREDENTIAL is not set for this lane');
+  return c || 'unnamed';
 }
 
 process.once('exit', () => { for (const f of [...kcHeldLocks.keys()]) kcReleaseLock(f); });
