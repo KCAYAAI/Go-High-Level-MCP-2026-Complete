@@ -153,12 +153,23 @@ const KC_LOC_KEYS = new Set(['locationid', 'location_id', 'locationids', 'share_
 /** The catalog has 58 location-scoped templates today; far fewer means it failed to load properly. */
 export const KC_MIN_CATALOG_TEMPLATES = 20;
 let kcLocPathTemplates: RegExp[] | null = null;
+let kcAgencyOnlyTemplates: RegExp[] = [];
 let kcCatalogPath = join(__dirname, '..', 'tools', 'official-spec-endpoints.json');
 
 /** Test hook: point the guard at a different catalog file and drop the cached templates. */
 export function kcSetCatalogPathForTests(path: string): void {
   kcCatalogPath = path;
   kcLocPathTemplates = null;
+  kcAgencyOnlyTemplates = [];
+}
+
+function kcTemplateRegex(path: string, captureLocation: boolean): RegExp {
+  const parts = path.split('/').map((s) => {
+    if (captureLocation && (s === '{locationId}' || s === '{location_id}')) return '([^/]+)';
+    if (/^\{[^}]+\}$/.test(s)) return '[^/]+';
+    return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  });
+  return new RegExp(`^${parts.join('/')}/?$`, 'i');
 }
 
 /**
@@ -176,16 +187,17 @@ function kcLocationPathTemplates(): RegExp[] {
     throw new Error(`KC lane guard: endpoint catalog unreadable (${(e as Error).name}); public API calls are blocked in this lane`);
   }
   if (!Array.isArray(spec)) throw new Error('KC lane guard: endpoint catalog malformed; public API calls are blocked in this lane');
-  for (const e of spec as { path?: unknown }[]) {
+  const agencyOnly: RegExp[] = [];
+  for (const e of spec as { path?: unknown; securitySchemes?: unknown }[]) {
     const p = e?.path;
-    if (typeof p !== 'string' || !/\{(locationId|location_id)\}/.test(p)) continue;
-    const parts = p.split('/').map((s) => {
-      if (s === '{locationId}' || s === '{location_id}') return '([^/]+)';
-      if (/^\{[^}]+\}$/.test(s)) return '[^/]+';
-      return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    });
-    out.push(new RegExp(`^${parts.join('/')}/?$`, 'i'));
+    if (typeof p !== 'string') continue;
+    const schemes = Array.isArray(e.securitySchemes) ? (e.securitySchemes as string[]) : [];
+    const agency = schemes.some((s) => s.startsWith('Agency-Access'));
+    const location = schemes.some((s) => s.startsWith('Location-Access'));
+    if (agency && !location) agencyOnly.push(kcTemplateRegex(p, false));
+    if (/\{(locationId|location_id)\}/.test(p)) out.push(kcTemplateRegex(p, true));
   }
+  kcAgencyOnlyTemplates = agencyOnly;
   if (out.length - 1 < KC_MIN_CATALOG_TEMPLATES) {
     throw new Error(`KC lane guard: endpoint catalog has only ${out.length - 1} location templates; public API calls are blocked in this lane`);
   }
@@ -266,6 +278,94 @@ function kcCollectBodyLocations(data: unknown, out: unknown[], depth = 0): void 
   }
 }
 
+/** Parse the final URL after refusing traversal, encoding, backslashes, dot/empty segments, control characters. */
+function kcSafeUrl(rawUrl: string, fullUrl: string): URL {
+  const unsafe = () => { throw new Error('KC lane guard: blocked a public API request with an unsafe path'); };
+  const rawPath = rawUrl.split('?')[0].replace(/^[a-z]+:\/\/[^/]*/i, '');
+  if (/\.\.|%|\\|[\x00-\x1f\x7f]/.test(rawPath) || /(^|\/)\.(\/|$)/.test(rawPath) || rawPath.includes('//')) unsafe();
+  const u = new URL(fullUrl);
+  // Final path: no empty segments (an edge server that merges slashes would see a different route).
+  if (u.pathname.includes('//')) unsafe();
+  return u;
+}
+
+// ─── Agency lane: per-sub-account token routing ─────────────
+// GHL agency private integrations only carry agency-level scopes; sub-account data needs that
+// sub-account's own private integration. The launcher passes them as KC_GHL_LOCATION_TOKENS
+// (JSON {locationId: token}); each public request is sent with the token of the one sub-account
+// it names. Agency-only endpoints keep the agency token (GHL_API_KEY).
+let kcLocTokenMap: Map<string, string> | null = null;
+
+/**
+ * Agency-level paths not described in the endpoint catalog. Variables, not code: extend per lane with
+ * KC_GHL_AGENCY_PATHS (comma-separated path prefixes) in the lane registry's "env".
+ */
+export const KC_DEFAULT_AGENCY_PATHS = [
+  '/locations/search', '/companies/', '/users/search', '/snapshots', '/saas', '/saas-api', '/oauth',
+  '/custom-menus', '/marketplace', '/phone-system/number-pools',
+];
+
+function kcIsAgencyPath(pathname: string): boolean {
+  const p = pathname.toLowerCase();
+  if (p === '/locations' || p === '/locations/') return true; // create/list sub-accounts
+  const extra = (process.env.KC_GHL_AGENCY_PATHS || '').split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  return [...KC_DEFAULT_AGENCY_PATHS, ...extra].some((prefix) => p.startsWith(prefix.toLowerCase()))
+    || kcAgencyOnlyTemplates.some((re) => re.test(pathname));
+}
+
+function kcLocationTokens(): Map<string, string> {
+  if (kcLocTokenMap) return kcLocTokenMap;
+  const m = new Map<string, string>();
+  const raw = process.env.KC_GHL_LOCATION_TOKENS;
+  if (raw) {
+    let o: unknown;
+    try { o = JSON.parse(raw); } catch { throw new Error('KC agency lane: KC_GHL_LOCATION_TOKENS is not valid JSON'); }
+    for (const [k, v] of Object.entries(o as Record<string, unknown>)) {
+      if (/^[A-Za-z0-9]{20}$/.test(k) && typeof v === 'string' && v) m.set(k, v);
+    }
+  }
+  kcLocTokenMap = m;
+  return m;
+}
+
+/** Test hook. */
+export function kcResetLocationTokensForTests(): void {
+  kcLocTokenMap = null;
+}
+
+/**
+ * Unpinned (agency) lane only: the bearer token this public request must carry, or undefined to
+ * keep the agency token. Agency-only endpoints keep the agency token; a request naming one
+ * sub-account uses that sub-account's token; naming several is refused; naming none uses the lane's
+ * default sub-account (GHL_LOCATION_ID) token. Agency endpoints (catalog Agency-Access-only, plus
+ * KC_DEFAULT_AGENCY_PATHS and KC_GHL_AGENCY_PATHS) always keep the agency token.
+ */
+export function kcAgencyTokenFor(rawUrl: string, fullUrl: string, data: unknown): string | undefined {
+  if (!kcLaneMode() || kcPinned()) return undefined;
+  const tokens = kcLocationTokens();
+  if (tokens.size === 0) return undefined;
+  const u = kcSafeUrl(rawUrl, fullUrl);
+  const templates = kcLocationPathTemplates(); // also loads the agency-only list
+  if (kcIsAgencyPath(u.pathname)) return undefined;
+  const named: unknown[] = [];
+  for (const re of templates) {
+    const m = u.pathname.match(re);
+    if (m && /^[A-Za-z0-9]{20}$/.test(m[1])) named.push(m[1]);
+  }
+  kcCollectPairs(u.searchParams.entries(), named);
+  kcCollectBodyLocations(data, named);
+  const locs = new Set(named.filter((v) => v !== undefined && v !== null && v !== '').map(String));
+  if (locs.size > 1) throw new Error('KC agency lane: this request names more than one sub-account; send one request per sub-account');
+  const loc = locs.size === 1 ? [...locs][0] : process.env.GHL_LOCATION_ID;
+  if (!loc) return undefined;
+  const tok = tokens.get(loc);
+  if (!tok) {
+    if (locs.size === 0) return undefined;
+    throw new Error(`KC agency lane: no sub-account token for location ${loc}; add one to the lane registry (see kc/README.md)`);
+  }
+  return tok;
+}
+
 /**
  * Inside a pinned lane, every location named anywhere in a public API request must be
  * the lane's location. Checks the final serialized URL (after path normalization and
@@ -277,13 +377,7 @@ export function kcAssertPublicRequest(rawUrl: string, fullUrl: string, data: unk
   const pin = kcPinned();
   if (!pin) return;
   const block = () => { throw new Error("KC lane guard: blocked a public API request for a location outside this lane's account"); };
-  const unsafe = () => { throw new Error('KC lane guard: blocked a public API request with an unsafe path'); };
-  // Raw path (before the query): no traversal, encoding, backslashes, dot segments, or control characters.
-  const rawPath = rawUrl.split('?')[0].replace(/^[a-z]+:\/\/[^/]*/i, '');
-  if (/\.\.|%|\\|[\x00-\x1f\x7f]/.test(rawPath) || /(^|\/)\.(\/|$)/.test(rawPath) || rawPath.includes('//')) unsafe();
-  const u = new URL(fullUrl);
-  // Final path: no empty segments (an edge server that merges slashes would see a different route).
-  if (u.pathname.includes('//')) unsafe();
+  const u = kcSafeUrl(rawUrl, fullUrl);
   const named: unknown[] = [];
   for (const re of kcLocationPathTemplates()) {
     const m = u.pathname.match(re);

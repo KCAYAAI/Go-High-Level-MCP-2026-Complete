@@ -46,6 +46,39 @@ Outside a lane (no `KC_GHL_LANE`) the server behaves exactly like upstream.
   Caller cancellation aborts in-flight requests and blocks later writes.
 - **No ambient credentials.** In a lane the server skips `.env` loading and the legacy workflow-builder env file.
 
+## Agency lane: one private integration per sub-account
+
+A GHL **agency** private integration only offers agency-level scopes (sub-accounts, users, snapshots,
+SaaS, phone numbers, and similar). It cannot read contacts, conversations, opportunities, or other
+sub-account data, and it cannot mint sub-account tokens. Each sub-account therefore has its own
+**sub-account** private integration, and the unpinned agency lane picks the right one per request:
+
+| Request | Token sent |
+|---|---|
+| Agency endpoint: catalog `Agency-Access`-only, `KC_DEFAULT_AGENCY_PATHS`, or `KC_GHL_AGENCY_PATHS` | agency token (`GHL_API_KEY`) |
+| Names one sub-account (path, query, or body) | that sub-account's token |
+| Names no sub-account (for example, contact by ID) | the lane's default sub-account (`location_id`) token |
+| Names two sub-accounts, or one with no registered token | refused before sending |
+
+Everything is data in the lane registry; adding a sub-account needs no code change:
+
+```json
+"ghl_agency_admin": {
+  "pinned": false,
+  "location_tokens": { "<locationId>": "<VAULT_KEY>" },
+  "env": { "GHL_USER_TYPE": "", "KC_GHL_AGENCY_PATHS": "/extra-agency-prefix" }
+}
+```
+
+To add a sub-account:
+
+1. In GHL, switch into the sub-account → **Settings → Private Integrations → Create new integration**.
+   Name it `Hermes agency lane (read-only)` and select only the read scopes (`*.readonly`, `*.read`).
+2. Store the token in the vault: `kc-secret set <VAULT_KEY>` (never paste it in chat).
+3. Register it: `kc-ghl --add-subaccount <locationId> --vault-key <VAULT_KEY>`. This verifies the token
+   reads that sub-account and nothing else, backs up `lanes.json`, and adds the entry.
+4. Restart the lane (`/reload-mcp` in open sessions).
+
 ## Token keeper (`kc/bin/kc-ghl-token-keeper`)
 
 The single writer for Firebase logins. A systemd user timer (`kc/systemd/`) runs it every 10 minutes.

@@ -93,9 +93,21 @@
         "GHL_FIREBASE_REFRESH_TOKEN": "LD_GHL_FIREBASE_REFRESH_TOKEN"
       },
       "callers": [
+        "aya",
+        "brand",
+        "cadence",
+        "dev",
+        "fiona",
         "roary",
-        "brand"
-      ]
+        "scout"
+      ],
+      "location_tokens": {
+        "EXAMPLE0000000000001": "EXAMPLE_SUBACCOUNT_1_PRIVATE_INTEGRATION_TOKEN",
+        "EXAMPLE0000000000002": "EXAMPLE_SUBACCOUNT_2_PRIVATE_INTEGRATION_TOKEN"
+      },
+      "env": {
+        "GHL_USER_TYPE": ""
+      }
     }
   }
 }

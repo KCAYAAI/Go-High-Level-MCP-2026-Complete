@@ -385,7 +385,7 @@ import {
 } from '../types/ghl-types.js';
 import { resolveVersion } from './version-router.js';
 import { resolveRequestVersion } from './endpoint-version-resolver.js';
-import { kcAssertPublicRequest, kcCheckCall, kcCheckWrite, kcRequestSignal, kcLaneMode, kcIsWrite, kcUnknownOutcome } from '../kc/lane.js';
+import { kcAssertPublicRequest, kcCheckCall, kcCheckWrite, kcRequestSignal, kcLaneMode, kcIsWrite, kcUnknownOutcome, kcAgencyTokenFor } from '../kc/lane.js';
 
 /**
  * GoHighLevel API Client
@@ -422,6 +422,12 @@ export class GHLApiClient {
         if (kcLaneMode()) {
           // KC lanes: refuse other accounts on the final URL axios will send, and keep inside the call deadline.
           kcAssertPublicRequest(String(config.url || ''), this.axiosInstance.getUri(config), config.data);
+          // Agency lane: send sub-account requests with that sub-account's own token.
+          const routed = kcAgencyTokenFor(String(config.url || ''), this.axiosInstance.getUri(config), config.data);
+          if (routed) {
+            if (typeof config.headers?.set === 'function') config.headers.set('Authorization', `Bearer ${routed}`);
+            else if (config.headers) (config.headers as Record<string, string>).Authorization = `Bearer ${routed}`;
+          }
           kcCheckCall(`${(config.method || 'get').toUpperCase()} request`);
           kcCheckWrite(config.method || 'get');
           // Always bound by the call deadline and caller cancellation, even if the request brought its own signal.

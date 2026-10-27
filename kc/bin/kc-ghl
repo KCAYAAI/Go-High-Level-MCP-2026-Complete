@@ -5,13 +5,18 @@ Usage:
   kc-ghl --lane <lane> --caller <profile>          start the BusyBee MCP server for that lane
   kc-ghl --lane <lane> --caller <profile> --check  validate lane, caller, and secrets; start nothing
   kc-ghl --list                                    show lanes and allowed callers
+  kc-ghl --add-subaccount <locationId> --vault-key <KEY> [--lane ghl_agency_admin] [--replace]
+                                                   give the agency lane a sub-account's private
+                                                   integration (already stored in the vault under KEY):
+                                                   verifies the token reads that sub-account and
+                                                   nothing else, backs up the registry, adds the entry
 
 The lane registry (lanes.json) holds no secrets. Secrets come from the KC vault by
 name at launch and only the lane's own secrets enter the server process.
 --caller is attribution for the audit log, not authentication: every profile runs
 as the same OS user.
 """
-import argparse, json, os, shutil, subprocess, sys
+import argparse, json, os, re, shutil, subprocess, sys, time, urllib.error, urllib.request
 
 REGISTRY = os.environ.get('KC_GHL_REGISTRY', '/home/aya/.local/share/kc-ghl/lanes.json')
 WORKDIR = '/home/aya/.local/share/kc-ghl'  # no .env here; the server never reads a stray one
@@ -40,15 +45,80 @@ def secret(name):
     return value
 
 
+def ghl_get(token, path):
+    req = urllib.request.Request(f'https://services.leadconnectorhq.com{path}', headers={
+        'Authorization': f'Bearer {token}', 'Version': '2021-07-28', 'Accept': 'application/json',
+        'User-Agent': 'kc-ghl/1.0 (+KC Hermes lanes)'})  # GHL's edge rejects the default urllib agent
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status, json.loads(r.read() or b'{}')
+    except urllib.error.HTTPError as e:
+        return e.code, {}
+
+
+def add_subaccount(reg, lane_name, loc, key, replace=False):
+    """Register one sub-account private integration on an unpinned lane. Variables only: no code change."""
+    if not re.fullmatch(r'[A-Za-z0-9]{20}', loc or ''):
+        fail('location ID must be 20 letters/digits')
+    if not re.fullmatch(r'[A-Z][A-Z0-9_]{2,80}', key or ''):
+        fail('--vault-key must be an ENV_STYLE vault key name')
+    lane = reg.get('lanes', {}).get(lane_name)
+    if lane is None:
+        fail(f'unknown lane {lane_name}')
+    if lane.get('pinned', True):
+        fail(f'lane {lane_name} is pinned; sub-account tokens are only for the unpinned (agency) lane')
+    token = secret(key)
+    status, body = ghl_get(token, f'/locations/{loc}')
+    name = (body.get('location') or {}).get('name', '')
+    if status != 200:
+        fail(f'token in {key} cannot read location {loc} (HTTP {status})')
+    # Must read this sub-account's own data (an agency token can read the record but not contacts) ...
+    s_own, _ = ghl_get(token, f'/contacts/?locationId={loc}&limit=1')
+    if s_own != 200:
+        fail(f'token in {key} cannot read contacts in {loc} (HTTP {s_own}); expected that sub-account\'s own private integration')
+    # ... and nothing in any other sub-account.
+    others = [l for l in [lane.get('location_id')] + list((lane.get('location_tokens') or {}).keys()) if l and l != loc]
+    for other in dict.fromkeys(others):
+        s2, _ = ghl_get(token, f'/contacts/?locationId={other}&limit=1')
+        if s2 == 200:
+            fail(f'token in {key} can also read sub-account {other}; expected a sub-account-scoped private integration')
+    current = lane.get('location_tokens') or {}
+    if current.get(loc) == key:
+        print(f'already registered | {loc} ({name}) -> {key}')
+        return
+    if loc in current and not replace:
+        fail(f'{loc} is already registered with {current[loc]}; pass --replace to change it')
+    os.makedirs(os.path.join(os.path.dirname(REGISTRY), 'backups'), mode=0o700, exist_ok=True)
+    backup = os.path.join(os.path.dirname(REGISTRY), 'backups', f'{os.path.basename(REGISTRY)}.{time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())}')
+    shutil.copy2(REGISTRY, backup)
+    current[loc] = key
+    lane['location_tokens'] = dict(sorted(current.items()))
+    tmp = f'{REGISTRY}.{os.getpid()}.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(reg, f, indent=2)
+        f.write('\n')
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, REGISTRY)
+    print(f'added | lane {lane_name} | {loc} ({name}) -> {key} | {len(current)} sub-accounts | backup {backup}')
+    print('restart the lane (or /reload-mcp in open sessions) to load it')
+
+
 def main():
     ap = argparse.ArgumentParser(prog='kc-ghl')
     ap.add_argument('--lane')
     ap.add_argument('--caller')
     ap.add_argument('--check', action='store_true')
     ap.add_argument('--list', action='store_true')
+    ap.add_argument('--add-subaccount', metavar='LOCATION_ID')
+    ap.add_argument('--vault-key')
+    ap.add_argument('--replace', action='store_true')
     a = ap.parse_args()
     reg = load()
     lanes = reg.get('lanes', {})
+
+    if a.add_subaccount:
+        add_subaccount(reg, a.lane or 'ghl_agency_admin', a.add_subaccount, a.vault_key, a.replace)
+        return
 
     if a.list:
         for name, lane in lanes.items():
@@ -89,6 +159,19 @@ def main():
         env['KC_GHL_PINNED_LOCATION'] = lane['location_id']
     for env_name, vault_name in lane['secrets'].items():
         env[env_name] = secret(vault_name)
+    # Agency lane: one private integration per sub-account ({locationId: vault key}).
+    loc_tokens = lane.get('location_tokens') or {}
+    if not isinstance(loc_tokens, dict):
+        fail(f'lane {a.lane}: location_tokens must be an object of locationId -> vault key')
+    if loc_tokens:
+        if lane.get('pinned', True):
+            fail(f'lane {a.lane}: location_tokens is only for unpinned (agency) lanes')
+        env['KC_GHL_LOCATION_TOKENS'] = json.dumps({loc: secret(key) for loc, key in loc_tokens.items()})
+    for k, v in (lane.get('env') or {}).items():
+        if v is None or v == '':
+            env.pop(k, None)
+        else:
+            env[k] = str(v)
 
     node = shutil.which('node', path=env.get('PATH'))
     if not node:
@@ -97,7 +180,8 @@ def main():
         fail('BusyBee server build is missing')
 
     if a.check:
-        print(f"ok | lane {a.lane} | caller {a.caller} | account {lane['account']} | {len(lane['secrets'])} secrets loaded")
+        print(f"ok | lane {a.lane} | caller {a.caller} | account {lane['account']} | {len(lane['secrets'])} secrets loaded"
+              + (f" | {len(loc_tokens)} sub-account tokens" if loc_tokens else ''))
         return
     os.chdir(WORKDIR)
     os.execve(node, [node, reg['server']], env)
