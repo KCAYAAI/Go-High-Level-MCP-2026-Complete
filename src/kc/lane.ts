@@ -14,10 +14,9 @@
  *   KC_GHL_AUDIT_LOG         JSONL audit log path
  */
 import { AsyncLocalStorage } from 'async_hooks';
-import {
-  appendFileSync, mkdirSync, readFileSync, statSync, renameSync, linkSync, unlinkSync, writeFileSync,
-} from 'fs';
+import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
+import { createServer, type Server } from 'net';
 
 export const kcSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 export const kcLaneMode = (): boolean => !!process.env.KC_GHL_LANE;
@@ -416,60 +415,29 @@ export function kcAssertPublicRequest(rawUrl: string, fullUrl: string, data: unk
   }
 }
 
-// ─── Shared token cache: lock helpers ───────────────────────
-export const KC_LOCK_ABANDONED_MS = 600_000; // treat as abandoned past this age even if the PID looks alive (PID reuse)
-const KC_LOCK_INIT_GRACE_MS = 30_000; // an empty lock is a holder still writing its PID
-export const kcHeldLocks = new Map<string, number>(); // lock path -> inode we created
-
-function kcPidAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === 'EPERM'; }
-}
-
+// ─── Shared token cache: refresh lock ───────────────────────
 /**
- * Remove a lock only if its holder is gone. Never removes a live holder's lock.
- * Residual risk (documented): under a three-way race around an abandoned lock, two
- * processes can briefly both refresh. The cost is one extra token exchange, never a
- * wrong account or a corrupt cache (writes are atomic renames of valid tokens).
+ * One refresh per login at a time, across every lane process and the token keeper. The lock is a
+ * Linux abstract Unix socket name: binding it is atomic and exclusive, and the kernel frees it the
+ * instant the holder exits or crashes, so there are no lock files, stale PIDs, or take-over races.
+ * The keeper (Python) binds the same name. Abstract names are per network namespace and not
+ * permission-checked; on this single-user host the worst a squatter could do is delay refreshes.
  */
-export function kcClaimAbandonedLock(lockFile: string): void {
-  let st;
-  let text = '';
-  try {
-    st = statSync(lockFile);
-    text = readFileSync(lockFile, 'utf8').trim();
-  } catch {
-    return; // vanished or unreadable: wait and retry
-  }
-  const age = Date.now() - st.mtimeMs;
-  let abandoned: boolean;
-  if (text === '') abandoned = age > KC_LOCK_INIT_GRACE_MS; // holder may be between open and PID write
-  else abandoned = !kcPidAlive(parseInt(text, 10)) || age > KC_LOCK_ABANDONED_MS;
-  if (!abandoned) return;
-  const claimed = `${lockFile}.abandoned-${process.pid}-${Date.now()}`;
-  try {
-    renameSync(lockFile, claimed); // only one waiter can move a given inode
-  } catch {
-    return;
-  }
-  try {
-    if (statSync(claimed).ino !== st.ino) {
-      // We moved a fresh lock created in between. Put it back without overwriting anything.
-      try { linkSync(claimed, lockFile); } catch { /* a newer lock exists; leave it */ }
-    }
-  } finally {
-    try { unlinkSync(claimed); } catch { /* gone */ }
-  }
+export function kcLockName(cacheId: string): string {
+  return `\0kc-ghl-refresh-${cacheId}`;
 }
 
-export function kcReleaseLock(lockFile: string): void {
-  const ino = kcHeldLocks.get(lockFile);
-  kcHeldLocks.delete(lockFile);
-  if (ino === undefined) return;
-  try {
-    // Never delete another holder's lock: inode and content (our PID) must both match.
-    if (statSync(lockFile).ino === ino && readFileSync(lockFile, 'utf8').trim() === String(process.pid)) unlinkSync(lockFile);
-  } catch { /* already gone */ }
+/** Try once to take the lock. Resolves the held server, or null if another process holds it. */
+export function kcTryLock(name: string): Promise<Server | null> {
+  return new Promise((resolve, reject) => {
+    const s = createServer((sock) => sock.destroy());
+    s.once('error', (e: NodeJS.ErrnoException) => (e.code === 'EADDRINUSE' ? resolve(null) : reject(e)));
+    s.listen({ path: name }, () => { s.unref(); resolve(s); });
+  });
+}
+
+export function kcUnlock(s: Server | null): void {
+  try { s?.close(); } catch { /* already closed */ }
 }
 
 /** Cache identity for a lane's login. Required in lane mode so two logins can never share a cache. */
@@ -479,7 +447,7 @@ export function kcCredentialName(): string {
   return c || 'unnamed';
 }
 
-process.once('exit', () => { for (const f of [...kcHeldLocks.keys()]) kcReleaseLock(f); });
+
 
 /**
  * A lane never writes the vault. If Firebase hands back a new refresh token, the lane leaves it

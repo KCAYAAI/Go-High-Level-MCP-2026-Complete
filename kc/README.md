@@ -38,9 +38,11 @@ Outside a lane (no `KC_GHL_LANE`) the server behaves exactly like upstream.
   and every public API request must target the pinned location. Checked on the final URL after normalization,
   query merging, and the JSON body. Workflow and location IDs must be plain identifiers (no `..`, `/`, `%`, `\`).
   The workflow tools accept an optional `locationId`; pinned lanes only allow their own, the agency lane any.
-- **Shared token cache.** One Firebase ID token per login, shared by every lane on that login. One refresh at a time
-  (PID lock file), waiters reuse the result, Google 429 retried after 5/10/20 s. A token GHL rejects (401) is cleared
-  for every lane. Malformed tokens are never cached.
+- **Shared token cache.** One Firebase ID token per login, shared by every lane on that login. One refresh at a time:
+  the lock is a Linux abstract Unix socket (`\0kc-ghl-refresh-<id>`) that the lanes and the keeper bind; the kernel
+  frees it the moment the holder exits or crashes. Waiters reuse the result; Google 429 retried after 5/10/20 s.
+  A token GHL rejects (401) is refreshed once under the lock; a newer token another lane published is never
+  overwritten. Malformed tokens are never cached.
 - **Per-call deadline.** Hermes allows 120 s per tool call. Each call gets 100 s for auth plus all its requests.
   A write (POST/PUT/PATCH/DELETE) is not sent unless 27 s remain, so nothing lands after the caller gives up.
   Caller cancellation aborts in-flight requests and blocks later writes.
@@ -100,9 +102,6 @@ journalctl --user -u kc-ghl-token-keeper -n 20    # recent runs
 ```
 
 Known limits (accepted): `--caller` is attribution, not authentication (all agents run as one OS user).
-A rare three-way race around an abandoned lock can cause one extra token refresh, never a wrong
-account or corrupt cache.
-
 ## Test
 
 ```bash

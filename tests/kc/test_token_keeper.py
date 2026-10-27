@@ -152,26 +152,49 @@ class KeeperTest(unittest.TestCase):
         self.assertEqual(self.k.vault_get('T_RT'), 'NEW')
         self.assertEqual(self.files('.refresh-pending'), [])
 
-    def test_live_lock_is_respected(self):
-        self.k.vault_set('T_RT', 'S')
-        self.run_keeper()
+    def _cid(self):
         cache = [f for f in self.files('.json') if not f.endswith('keeper-status.json')][0]
-        lock = cache.replace('.json', '.lock'); open(lock, 'w').write(str(os.getppid()))
-        self.k.LOCK_WAIT_S = 0.2
-        self.assertEqual(self.run_keeper('--force'), 1)
-        self.assertTrue(os.path.exists(lock))
-        self.assertIn('lock', self.status()['last_error'])
-        os.unlink(lock)
+        return os.path.basename(cache)[:-5]
 
-    def test_dead_pid_lock_is_reclaimed(self):
-        self.k.vault_set('T_RT', 'S')
-        os.makedirs(self.cache, exist_ok=True)
-        self.run_keeper()
-        cache = [f for f in self.files('.json') if not f.endswith('keeper-status.json')][0]
-        dead = subprocess.run([sys.executable, '-c', 'import os;print(os.getpid())'], capture_output=True, text=True).stdout.strip()
-        open(cache.replace('.json', '.lock'), 'w').write(dead)
+    def _hold_py(self, cid):
+        code = "import socket,time\ns=socket.socket(socket.AF_UNIX)\ns.bind('\\x00kc-ghl-refresh-%s')\nprint('held',flush=True)\ntime.sleep(60)" % cid
+        ch = subprocess.Popen([sys.executable, '-c', code], stdout=subprocess.PIPE, text=True)
+        ch.stdout.readline()
+        return ch
+
+    def _hold_node(self, cid):
+        code = "const s=require('net').createServer();s.listen({path:'\\u0000kc-ghl-refresh-%s'},()=>{process.stdout.write('held\\n')});setInterval(()=>{},1e6)" % cid
+        ch = subprocess.Popen(['node', '-e', code], stdout=subprocess.PIPE, text=True)
+        ch.stdout.readline()
+        return ch
+
+    def test_live_lock_is_respected(self):
+        self.k.vault_set('T_RT', 'S'); self.run_keeper()
+        ch = self._hold_py(self._cid())
+        try:
+            self.k.LOCK_WAIT_S = 0.3
+            n = len(Firebase.CALLS)
+            self.assertEqual(self.run_keeper('--force'), 1)
+            self.assertEqual(len(Firebase.CALLS), n, 'no refresh while another process holds the lock')
+            self.assertIn('lock', self.status()['last_error'])
+        finally:
+            ch.kill(); ch.wait()
+
+    def test_holder_crash_frees_the_lock_immediately(self):
+        self.k.vault_set('T_RT', 'S'); self.run_keeper()
+        ch = self._hold_py(self._cid())
+        ch.kill(); ch.wait()
         self.assertEqual(self.run_keeper('--force'), 0)
-        self.assertFalse(os.path.exists(cache.replace('.json', '.lock')))
+
+    def test_lane_and_keeper_share_one_lock(self):
+        """Cross-language: a Node lane holding the lock blocks the keeper."""
+        self.k.vault_set('T_RT', 'S'); self.run_keeper()
+        ch = self._hold_node(self._cid())
+        try:
+            self.k.LOCK_WAIT_S = 0.3
+            self.assertEqual(self.run_keeper('--force'), 1)
+        finally:
+            ch.kill(); ch.wait()
 
     def test_no_secret_values_in_output_or_status(self):
         import io, contextlib

@@ -9,11 +9,12 @@
  */
 
 import { randomUUID, createHash } from 'crypto';
-import { readFileSync, writeFileSync, existsSync, openSync, closeSync, renameSync, mkdirSync, fstatSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, renameSync, mkdirSync } from 'fs';
+import type { Server } from 'net';
 import { resolve, join } from 'path';
 import {
   kcSleep, kcLaneMode, kcPinned, kcAssertId, kcAssertLocationAllowed, kcCheckCall, kcCheckWrite,
-  kcRequestSignal, kcRemainingMs, kcClaimAbandonedLock, kcReleaseLock, kcHeldLocks, kcJwtExp,
+  kcRequestSignal, kcRemainingMs, kcTryLock, kcUnlock, kcLockName, kcJwtExp,
   KC_AUTH_BUDGET_MS, kcCredentialName, kcStashRotatedRefreshToken, kcIsWrite, kcUnknownOutcome, kcJwtIat, KC_FRESH_TOKEN_MS,
   kcPlanRequests, KcPartialWriteError,
 } from '../kc/lane.js';
@@ -300,7 +301,6 @@ export class WorkflowBuilderClient {
     const credential = kcCredentialName();
     const id = createHash('sha256').update(`${credential}:${this.config.firebaseApiKey}`).digest('hex').slice(0, 24);
     const cacheFile = join(dir, `${id}.json`);
-    const lockFile = join(dir, `${id}.lock`);
     this.kcCacheFile = cacheFile;
     const margin = 120_000;
     const useCache = (): boolean => {
@@ -320,22 +320,17 @@ export class WorkflowBuilderClient {
     };
     if (useCache()) return;
 
-    let fd: number | null = null;
-    while (fd === null) {
+    let lock: Server | null = null;
+    while (!lock) {
       if (Date.now() > deadline) throw new Error('KC token cache: timed out waiting for another lane to refresh');
       kcCheckCall('token refresh');
-      try {
-        fd = openSync(lockFile, 'wx', 0o600);
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
-        kcClaimAbandonedLock(lockFile);
+      lock = await kcTryLock(kcLockName(id));
+      if (!lock) {
         await kcSleep(500);
         if (useCache()) return;
       }
     }
-    kcHeldLocks.set(lockFile, fstatSync(fd).ino);
     try {
-      writeFileSync(fd, String(process.pid));
       if (useCache()) return;
       await this.refreshFirebaseTokenWithBackoff(deadline);
       const expiresAt = this.idTokenExpiry();
@@ -345,8 +340,7 @@ export class WorkflowBuilderClient {
       renameSync(tmp, cacheFile);
       process.stderr.write('[KC GHL] Firebase token refreshed and shared\n');
     } finally {
-      closeSync(fd);
-      kcReleaseLock(lockFile);
+      kcUnlock(lock);
     }
   }
 

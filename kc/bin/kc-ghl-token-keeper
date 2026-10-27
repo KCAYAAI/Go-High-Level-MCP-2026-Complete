@@ -12,7 +12,7 @@ themselves) and owns refresh-token rotation:
      value under <KEY>, read it back, then clear the pending file.
   3. Write the ID token to the shared cache atomically.
 
-Same cache format and lock protocol as src/kc/lane.ts. Never prints token values;
+Same cache format and refresh lock as src/kc/lane.ts. Never prints token values;
 logs use 8-character SHA-256 prefixes. Alerts Slack on a dead login, on 3 straight
 failures, and on recovery.
 
@@ -20,7 +20,7 @@ failures, and on recovery.
   kc-ghl-token-keeper --status   show login health
   kc-ghl-token-keeper --force    refresh even if the cached token is fresh
 """
-import argparse, base64, hashlib, json, os, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
+import argparse, base64, errno, hashlib, json, os, socket, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
 from datetime import datetime, timezone
 
 REGISTRY = os.environ.get('KC_GHL_REGISTRY', '/home/aya/.local/share/kc-ghl/lanes.json')
@@ -30,8 +30,6 @@ ALERT_CHANNEL = os.environ.get('KC_GHL_ALERT_CHANNEL', '')
 REFRESH_WHEN_LEFT_S = 25 * 60       # keep at least this much ID-token life in the cache
 LOGIN_BUDGET_S = 90                 # per login, including 429 backoff
 LOCK_WAIT_S = 60
-LOCK_ABANDONED_S = 600
-LOCK_INIT_GRACE_S = 30
 ALERT_AFTER_FAILURES = 3
 DEAD = ('INVALID_REFRESH_TOKEN', 'TOKEN_EXPIRED', 'USER_DISABLED', 'USER_NOT_FOUND', 'INVALID_ID_TOKEN', 'PROJECT_NUMBER_MISMATCH', 'MISSING_REFRESH_TOKEN')
 
@@ -115,76 +113,30 @@ def read_json(path):
         return json.load(f)
 
 
-# ── lock (same protocol as src/kc/lane.ts) ───────────────────
-def pid_alive(pid):
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-
-
-def claim_abandoned(lock):
-    try:
-        st = os.stat(lock)
-    except OSError:
-        return
-    text = read_or_empty(lock)
-    age = time.time() - st.st_mtime
-    if text == '':
-        abandoned = age > LOCK_INIT_GRACE_S
-    else:
-        abandoned = (not text.isdigit()) or (not pid_alive(int(text))) or age > LOCK_ABANDONED_S
-    if not abandoned:
-        return
-    claimed = f'{lock}.abandoned-{os.getpid()}-{int(time.time() * 1000)}'
-    try:
-        os.rename(lock, claimed)
-    except OSError:
-        return
-    try:
-        if os.stat(claimed).st_ino != st.st_ino:
-            try:
-                os.link(claimed, lock)
-            except OSError:
-                pass
-    finally:
-        try:
-            os.unlink(claimed)
-        except OSError:
-            pass
-
-
+# ── lock (same as src/kc/lane.ts: Linux abstract Unix socket, freed by the kernel on exit/crash) ──
 class Lock:
-    def __init__(self, path):
-        self.path, self.ino = path, None
+    def __init__(self, cid):
+        self.name, self.sock = f'\0kc-ghl-refresh-{cid}', None
 
     def __enter__(self):
         deadline = time.time() + LOCK_WAIT_S
         while True:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             try:
-                fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                break
-            except FileExistsError:
+                s.bind(self.name)
+                self.sock = s
+                return self
+            except OSError as e:
+                s.close()
+                if e.errno != errno.EADDRINUSE:
+                    raise
                 if time.time() > deadline:
-                    raise Transient('another process held the refresh lock for 60 s')
-                claim_abandoned(self.path)
+                    raise Transient(f'another process held the refresh lock for {LOCK_WAIT_S} s')
                 time.sleep(0.5)
-        self.ino = os.fstat(fd).st_ino
-        os.write(fd, str(os.getpid()).encode())
-        os.close(fd)
-        return self
 
     def __exit__(self, *exc):
-        try:
-            if os.stat(self.path).st_ino == self.ino and read_or_empty(self.path) == str(os.getpid()):
-                os.unlink(self.path)
-        except OSError:
-            pass
+        if self.sock:
+            self.sock.close()
         return False
 
 
@@ -230,7 +182,7 @@ def keep_login(login, cache_dir, force):
     key = login['refresh_key']
     if not force and not os.path.exists(pending_file) and cache_left_s(cache_file) > REFRESH_WHEN_LEFT_S:
         return 'fresh'
-    with Lock(os.path.join(cache_dir, f'{cid}.lock')):
+    with Lock(cid):
         if not force and not os.path.exists(pending_file) and cache_left_s(cache_file) > REFRESH_WHEN_LEFT_S:
             return 'fresh'
         current = vault_get(key)

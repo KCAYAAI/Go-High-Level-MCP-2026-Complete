@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, readdirSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, spawn } from 'node:child_process';
 
 const A = 'AAAAAAAAAAAAAAAAAAA1', B = 'AAAAAAAAAAAAAAAAAAA2', C3 = 'AAAAAAAAAAAAAAAAAAA3';
 const results = [];
@@ -83,15 +83,6 @@ await test('auth that would cross the call deadline stops instead of sleeping pa
       });
     });
   } finally { firebaseMode = 'ok'; }
-});
-await test('release never deletes a lock now owned by someone else (same inode, other PID)', async () => {
-  const lock = cacheFile().replace('.json', '.lock');
-  writeFileSync(lock, String(process.ppid));
-  const { statSync } = await import('node:fs');
-  lane.kcHeldLocks.set(lock, statSync(lock).ino);
-  lane.kcReleaseLock(lock);
-  assert.ok(existsSync(lock));
-  (await import('node:fs')).unlinkSync(lock);
 });
 await test('own-account workflow calls work and stay in the pinned account', async () => {
   sent = [];
@@ -176,34 +167,52 @@ await test('429 backoff stops inside the auth budget and releases the lock', asy
       assert.ok(Date.now() - t0 <= lane.KC_AUTH_BUDGET_MS, `${Date.now() - t0} ms`);
     });
   } finally { firebaseMode = 'ok'; }
-  assert.ok(!existsSync(cacheFile().replace('.json', '.lock')));
+  const free = await lane.kcTryLock(lane.kcLockName(cacheFile().split('/').pop().replace('.json', ''))); assert.ok(free, 'lock released after the failed refresh'); lane.kcUnlock(free);
 });
 
 // ── Locks
-await test('lock held by a live PID is never taken, even after a long wait', async () => {
-  const lock = cacheFile().replace('.json', '.lock');
-  writeFileSync(cacheFile(), '{}');
-  writeFileSync(lock, String(process.ppid));
-  await fakeClock(async () => { await assert.rejects(() => client().listWorkflows({ limit: 1 }), /timed out waiting/); });
-  assert.ok(existsSync(lock), 'live holder lock untouched');
+// ── Refresh lock: kernel-held abstract socket, shared by lanes and the keeper
+const lockName = () => lane.kcLockName(cacheFile().split('/').pop().replace('.json', ''));
+const holdInChild = (name) => new Promise((res) => {
+  const ch = spawn(process.execPath, ['-e', `const s=require('net').createServer();s.listen({path:${JSON.stringify(name)}},()=>{process.stdout.write('held')});setInterval(()=>{},1e6)`]);
+  ch.stderr.on('data', (d) => process.stderr.write(d));
+  ch.stdout.once('data', () => res(ch));
 });
-await test('an empty (initializing) lock is respected during the grace period, reclaimed after', async () => {
-  const lock = cacheFile().replace('.json', '.lock');
-  writeFileSync(lock, '');
-  lane.kcClaimAbandonedLock(lock);
-  assert.ok(existsSync(lock), 'fresh empty lock kept');
-  const old = (Date.now() - 31_000) / 1000; utimesSync(lock, old, old);
-  lane.kcClaimAbandonedLock(lock);
-  assert.ok(!existsSync(lock), 'empty lock older than grace reclaimed');
-});
-await test('lock from a dead PID is reclaimed; no claim files left behind', async () => {
-  const lock = cacheFile().replace('.json', '.lock');
-  const dead = parseInt(spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))']).stdout.toString(), 10);
-  writeFileSync(lock, String(dead));
+await test('a lock held by another live process is never taken; the lane waits, then gives up cleanly', async () => {
   writeFileSync(cacheFile(), '{}');
+  const ch = await holdInChild(lockName());
+  try {
+    const before = firebaseCalls;
+    await fakeClock(async () => { await assert.rejects(() => client().listWorkflows({ limit: 1 }), /timed out waiting/); });
+    assert.equal(firebaseCalls, before, 'no refresh while another process holds the lock');
+  } finally { ch.kill('SIGKILL'); }
+});
+await test('holder killed with SIGKILL: the kernel frees the lock at once and the lane refreshes', async () => {
+  writeFileSync(cacheFile(), '{}');
+  const ch = await holdInChild(lockName());
+  ch.kill('SIGKILL'); await new Promise((r) => ch.once('exit', r));
+  const before = firebaseCalls;
   await client().listWorkflows({ limit: 1 });
-  assert.ok(!existsSync(lock));
-  assert.equal(readdirSync(cacheDir).filter((x) => x.includes('.abandoned-')).length, 0);
+  assert.equal(firebaseCalls, before + 1);
+});
+await test('two lane processes starting together on one login refresh exactly once', async () => {
+  writeFileSync(cacheFile(), '{}');
+  const counter = join(cacheDir, 'refresh-count.txt'); writeFileSync(counter, '');
+  const child = `
+    import { appendFileSync } from 'node:fs';
+    const b64 = (o) => Buffer.from(JSON.stringify(o)).toString('base64url');
+    globalThis.fetch = async (u) => {
+      if (String(u).includes('securetoken')) { appendFileSync(${JSON.stringify(counter)}, 'x'); await new Promise((r) => setTimeout(r, 400));
+        return new Response(JSON.stringify({ id_token: b64({alg:'none'}) + '.' + b64({ exp: Math.floor(Date.now()/1000)+3600 }) + '.s' }), { status: 200 }); }
+      return new Response('{"rows":[]}', { status: 200 });
+    };
+    const { WorkflowBuilderClient: C } = await import(${JSON.stringify(new URL('../../dist/clients/workflow-builder-client.js', import.meta.url).href)});
+    await new C({ apiKey: 'pit', firebaseApiKey: 'web-key', firebaseRefreshToken: 'TEST_REFRESH', userId: 'u', locationId: ${JSON.stringify(B)} }).listWorkflows({ limit: 1 });
+    process.stdout.write('done');`;
+  const run = () => new Promise((res) => { const c = spawn(process.execPath, ['--input-type=module', '-e', child], { env: process.env }); let out = ''; c.stdout.on('data', (d) => (out += d)); c.on('exit', (code) => res([code, out])); });
+  const results = await Promise.all([run(), run()]);
+  assert.deepEqual(results.map((r) => r[1]), ['done', 'done'], JSON.stringify(results));
+  assert.equal(readFileSync(counter, 'utf8').length, 1, 'exactly one Firebase refresh across both processes');
 });
 
 // ── Per-call deadline and cancellation (whole tool call, not one request)
