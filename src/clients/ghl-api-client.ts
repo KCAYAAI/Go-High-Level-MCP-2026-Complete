@@ -385,6 +385,7 @@ import {
 } from '../types/ghl-types.js';
 import { resolveVersion } from './version-router.js';
 import { resolveRequestVersion } from './endpoint-version-resolver.js';
+import { kcAssertPublicRequest, kcCheckCall, kcCheckWrite, kcRequestSignal, kcLaneMode } from '../kc/lane.js';
 
 /**
  * GoHighLevel API Client
@@ -418,6 +419,13 @@ export class GHLApiClient {
     // Add request interceptor for logging
     this.axiosInstance.interceptors.request.use(
       (config) => {
+        if (kcLaneMode()) {
+          // KC lanes: refuse other accounts on the final URL axios will send, and keep inside the call deadline.
+          kcAssertPublicRequest(String(config.url || ''), this.axiosInstance.getUri(config), config.data);
+          kcCheckCall(`${(config.method || 'get').toUpperCase()} request`);
+          kcCheckWrite(config.method || 'get');
+          if (!config.signal) config.signal = kcRequestSignal(30_000);
+        }
         const requestFallback = typeof config.headers?.get === 'function'
           ? config.headers.get('Version')
           : config.headers?.Version;

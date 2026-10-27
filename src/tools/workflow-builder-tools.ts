@@ -76,6 +76,10 @@ export class WorkflowBuilderTools {
         inputSchema: {
           type: 'object',
           properties: {
+            locationId: {
+              type: 'string',
+              description: 'Sub-account (location) ID. Optional: defaults to this connection\'s account. Pinned connections accept only their own account; the agency connection accepts any sub-account.',
+            },
             name: {
               type: 'string',
               description: 'Workflow name (required)',
@@ -129,6 +133,10 @@ export class WorkflowBuilderTools {
         inputSchema: {
           type: 'object',
           properties: {
+            locationId: {
+              type: 'string',
+              description: 'Sub-account (location) ID. Optional: defaults to this connection\'s account. Pinned connections accept only their own account; the agency connection accepts any sub-account.',
+            },
             limit: { type: 'number', description: 'Max workflows to return (default 50)' },
             offset: { type: 'number', description: 'Pagination offset (default 0)' },
             sortBy: { type: 'string', description: 'Sort field: name, createdAt, updatedAt (default name)' },
@@ -148,6 +156,10 @@ export class WorkflowBuilderTools {
         inputSchema: {
           type: 'object',
           properties: {
+            locationId: {
+              type: 'string',
+              description: 'Sub-account (location) ID. Optional: defaults to this connection\'s account. Pinned connections accept only their own account; the agency connection accepts any sub-account.',
+            },
             workflowId: {
               type: 'string',
               description: 'The workflow ID to retrieve',
@@ -170,6 +182,10 @@ export class WorkflowBuilderTools {
         inputSchema: {
           type: 'object',
           properties: {
+            locationId: {
+              type: 'string',
+              description: 'Sub-account (location) ID. Optional: defaults to this connection\'s account. Pinned connections accept only their own account; the agency connection accepts any sub-account.',
+            },
             workflowId: {
               type: 'string',
               description: 'The workflow ID to update',
@@ -230,6 +246,10 @@ export class WorkflowBuilderTools {
         inputSchema: {
           type: 'object',
           properties: {
+            locationId: {
+              type: 'string',
+              description: 'Sub-account (location) ID. Optional: defaults to this connection\'s account. Pinned connections accept only their own account; the agency connection accepts any sub-account.',
+            },
             workflowId: {
               type: 'string',
               description: 'The workflow ID to delete',
@@ -251,6 +271,10 @@ export class WorkflowBuilderTools {
         inputSchema: {
           type: 'object',
           properties: {
+            locationId: {
+              type: 'string',
+              description: 'Sub-account (location) ID. Optional: defaults to this connection\'s account. Pinned connections accept only their own account; the agency connection accepts any sub-account.',
+            },
             workflowId: {
               type: 'string',
               description: 'The workflow ID to publish',
@@ -272,6 +296,10 @@ export class WorkflowBuilderTools {
         inputSchema: {
           type: 'object',
           properties: {
+            locationId: {
+              type: 'string',
+              description: 'Sub-account (location) ID. Optional: defaults to this connection\'s account. Pinned connections accept only their own account; the agency connection accepts any sub-account.',
+            },
             workflowId: {
               type: 'string',
               description: 'The source workflow ID to clone',
@@ -301,21 +329,23 @@ export class WorkflowBuilderTools {
     }
 
     try {
+      const loc = params.locationId;
+      const c = loc === undefined || loc === '' ? this.client : this.client.forLocation(loc as string);
       switch (name) {
         case 'ghl_create_workflow':
-          return await this.createWorkflow(params);
+          return await this.createWorkflow(params, c);
         case 'ghl_list_workflows_full':
-          return await this.listWorkflowsFull(params);
+          return await this.listWorkflowsFull(params, c);
         case 'ghl_get_workflow_full':
-          return await this.getWorkflowFull(params);
+          return await this.getWorkflowFull(params, c);
         case 'ghl_update_workflow_actions':
-          return await this.updateWorkflowActions(params);
+          return await this.updateWorkflowActions(params, c);
         case 'ghl_delete_workflow_internal':
-          return await this.deleteWorkflow(params);
+          return await this.deleteWorkflow(params, c);
         case 'ghl_publish_workflow':
-          return await this.publishWorkflow(params);
+          return await this.publishWorkflow(params, c);
         case 'ghl_clone_workflow':
-          return await this.cloneWorkflow(params);
+          return await this.cloneWorkflow(params, c);
         default:
           return error(`Unknown workflow builder tool: ${name}`);
       }
@@ -326,12 +356,12 @@ export class WorkflowBuilderTools {
 
   // ─── Tool Implementations ─────────────────────────────────
 
-  private async createWorkflow(params: Record<string, unknown>): Promise<ToolResult> {
+  private async createWorkflow(params: Record<string, unknown>, c: WorkflowBuilderClient): Promise<ToolResult> {
     const name = params.name as string;
     if (!name) return error('name is required');
 
     // Step 1: Create empty workflow
-    const { id } = await this.client!.createWorkflow(name);
+    const { id } = await c.createWorkflow(name);
 
     // Step 2: Add actions if provided
     const rawActions = params.actions as WorkflowAction[] | undefined;
@@ -339,7 +369,7 @@ export class WorkflowBuilderTools {
     const publish = params.publish as boolean | undefined;
 
     if (rawActions?.length || trigger) {
-      await this.client!.updateWorkflow(id, {
+      await c.updateWorkflow(id, {
         actions: rawActions,
         triggers: trigger ? [trigger] : undefined,
         status: publish ? 'published' : 'draft',
@@ -348,11 +378,11 @@ export class WorkflowBuilderTools {
 
     // Step 3: Publish if requested (and not already done above)
     if (publish && !rawActions?.length && !trigger) {
-      await this.client!.publishWorkflow(id);
+      await c.publishWorkflow(id);
     }
 
     // Return final state
-    const workflow = await this.client!.getWorkflow(id);
+    const workflow = await c.getWorkflow(id);
     return success({
       message: `Workflow "${name}" created successfully`,
       workflow: {
@@ -367,13 +397,13 @@ export class WorkflowBuilderTools {
           name: t.name,
           id: t.id,
         })),
-        url: `https://app.gohighlevel.com/v2/location/${this.client!.getLocationId()}/automation/workflow/${workflow._id}`,
+        url: `https://app.gohighlevel.com/v2/location/${c.getLocationId()}/automation/workflow/${workflow._id}`,
       },
     });
   }
 
-  private async listWorkflowsFull(params: Record<string, unknown>): Promise<ToolResult> {
-    const result = await this.client!.listWorkflows({
+  private async listWorkflowsFull(params: Record<string, unknown>, c: WorkflowBuilderClient): Promise<ToolResult> {
+    const result = await c.listWorkflows({
       limit: params.limit as number | undefined,
       offset: params.offset as number | undefined,
       sortBy: params.sortBy as string | undefined,
@@ -393,11 +423,11 @@ export class WorkflowBuilderTools {
     });
   }
 
-  private async getWorkflowFull(params: Record<string, unknown>): Promise<ToolResult> {
+  private async getWorkflowFull(params: Record<string, unknown>, c: WorkflowBuilderClient): Promise<ToolResult> {
     const workflowId = params.workflowId as string;
     if (!workflowId) return error('workflowId is required');
 
-    const workflow = await this.client!.getWorkflow(workflowId);
+    const workflow = await c.getWorkflow(workflowId);
 
     return success({
       id: workflow._id,
@@ -407,15 +437,15 @@ export class WorkflowBuilderTools {
       actionCount: workflow.workflowData?.templates?.length || 0,
       actions: workflow.workflowData?.templates || [],
       triggers: workflow.triggers || [],
-      url: `https://app.gohighlevel.com/v2/location/${this.client!.getLocationId()}/automation/workflow/${workflow._id}`,
+      url: `https://app.gohighlevel.com/v2/location/${c.getLocationId()}/automation/workflow/${workflow._id}`,
     });
   }
 
-  private async updateWorkflowActions(params: Record<string, unknown>): Promise<ToolResult> {
+  private async updateWorkflowActions(params: Record<string, unknown>, c: WorkflowBuilderClient): Promise<ToolResult> {
     const workflowId = params.workflowId as string;
     if (!workflowId) return error('workflowId is required');
 
-    const workflow = await this.client!.updateWorkflow(workflowId, {
+    const workflow = await c.updateWorkflow(workflowId, {
       name: params.name as string | undefined,
       actions: params.actions as WorkflowAction[] | undefined,
       triggers: params.triggers as WorkflowTrigger[] | undefined,
@@ -438,11 +468,11 @@ export class WorkflowBuilderTools {
     });
   }
 
-  private async deleteWorkflow(params: Record<string, unknown>): Promise<ToolResult> {
+  private async deleteWorkflow(params: Record<string, unknown>, c: WorkflowBuilderClient): Promise<ToolResult> {
     const workflowId = params.workflowId as string;
     if (!workflowId) return error('workflowId is required');
 
-    await this.client!.deleteWorkflow(workflowId);
+    await c.deleteWorkflow(workflowId);
 
     return success({
       message: `Workflow ${workflowId} deleted successfully`,
@@ -450,11 +480,11 @@ export class WorkflowBuilderTools {
     });
   }
 
-  private async publishWorkflow(params: Record<string, unknown>): Promise<ToolResult> {
+  private async publishWorkflow(params: Record<string, unknown>, c: WorkflowBuilderClient): Promise<ToolResult> {
     const workflowId = params.workflowId as string;
     if (!workflowId) return error('workflowId is required');
 
-    const workflow = await this.client!.publishWorkflow(workflowId);
+    const workflow = await c.publishWorkflow(workflowId);
 
     return success({
       message: `Workflow "${workflow.name}" published successfully`,
@@ -465,12 +495,12 @@ export class WorkflowBuilderTools {
     });
   }
 
-  private async cloneWorkflow(params: Record<string, unknown>): Promise<ToolResult> {
+  private async cloneWorkflow(params: Record<string, unknown>, c: WorkflowBuilderClient): Promise<ToolResult> {
     const workflowId = params.workflowId as string;
     if (!workflowId) return error('workflowId is required');
 
     const newName = params.newName as string | undefined;
-    const workflow = await this.client!.cloneWorkflow(workflowId, newName);
+    const workflow = await c.cloneWorkflow(workflowId, newName);
 
     return success({
       message: `Workflow cloned as "${workflow.name}"`,
@@ -481,7 +511,7 @@ export class WorkflowBuilderTools {
         status: workflow.status,
         version: workflow.version,
         actionCount: workflow.workflowData?.templates?.length || 0,
-        url: `https://app.gohighlevel.com/v2/location/${this.client!.getLocationId()}/automation/workflow/${workflow._id}`,
+        url: `https://app.gohighlevel.com/v2/location/${c.getLocationId()}/automation/workflow/${workflow._id}`,
       },
     });
   }

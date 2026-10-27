@@ -18,7 +18,8 @@ import { GHLConfig } from './types/ghl-types.js';
 import { resolveVersion } from './clients/version-router.js';
 import { GHL_MCP_SERVER_INSTRUCTIONS } from './server-instructions.js';
 
-dotenv.config();
+// KC lanes get credentials only from the kc-ghl launcher, never from a stray .env.
+if (!process.env.KC_GHL_LANE) dotenv.config();
 
 class GHLMCPServer {
   private server: Server;

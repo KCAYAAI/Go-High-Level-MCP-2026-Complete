@@ -8,9 +8,14 @@
  * PUBLISH, and CLONE workflows with full action/trigger support.
  */
 
-import { randomUUID } from 'crypto';
-import { readFileSync, writeFileSync, existsSync } from 'fs';
-import { resolve } from 'path';
+import { randomUUID, createHash } from 'crypto';
+import { readFileSync, writeFileSync, existsSync, openSync, closeSync, renameSync, mkdirSync, fstatSync } from 'fs';
+import { resolve, join } from 'path';
+import {
+  kcSleep, kcLaneMode, kcPinned, kcAssertId, kcAssertLocationAllowed, kcCheckCall, kcCheckWrite,
+  kcRequestSignal, kcRemainingMs, kcClaimAbandonedLock, kcReleaseLock, kcHeldLocks, kcJwtExp,
+  KC_AUTH_BUDGET_MS,
+} from '../kc/lane.js';
 
 // ─── Types ──────────────────────────────────────────────────
 
@@ -90,8 +95,25 @@ export class WorkflowBuilderClient {
   private static readonly JWT_REFRESH_URL = 'https://services.leadconnectorhq.com/auth/refresh';
   private static readonly TOKEN_TTL_MS = 55 * 60 * 1000; // 55 minutes (tokens last 60)
 
+  private kcCacheFile: string | null = null;
+
   constructor(config: WorkflowBuilderConfig) {
     this.config = config;
+    // KC lane guard: a pinned lane's client may only target its own account.
+    const pin = kcPinned();
+    if (pin && pin !== config.locationId) {
+      throw new Error("KC lane guard: workflow client account does not match this lane's pinned account");
+    }
+  }
+
+  /**
+   * A client for another sub-account with the same login. In a pinned lane only the
+   * pinned account is allowed; in an unpinned (agency) lane any valid location ID is.
+   */
+  forLocation(locationId: string): WorkflowBuilderClient {
+    kcAssertLocationAllowed(locationId);
+    if (locationId === this.config.locationId) return this;
+    return new WorkflowBuilderClient({ ...this.config, locationId });
   }
 
   /**
@@ -107,8 +129,9 @@ export class WorkflowBuilderClient {
 
     const envVars: Record<string, string> = {};
 
-    // Load skill env file
-    if (existsSync(skillEnvPath)) {
+    const kcLane = kcLaneMode();
+    // Load skill env file (never inside a KC lane: lanes take credentials only from the launcher)
+    if (!kcLane && existsSync(skillEnvPath)) {
       for (const line of readFileSync(skillEnvPath, 'utf8').split('\n')) {
         const eqIdx = line.indexOf('=');
         if (eqIdx > 0) {
@@ -126,11 +149,11 @@ export class WorkflowBuilderClient {
       apiKey: get('GHL_API_KEY'),
       firebaseApiKey: get('GHL_FIREBASE_API_KEY'),
       firebaseRefreshToken: get('GHL_FIREBASE_REFRESH_TOKEN'),
-      refreshToken: get('GHL_REFRESH_TOKEN') || get('GHL_AUTH_REFRESH_TOKEN'),
+      refreshToken: kcLane ? '' : (get('GHL_REFRESH_TOKEN') || get('GHL_AUTH_REFRESH_TOKEN')),
       locationId: get('GHL_LOCATION_ID') || 'DZEpRd43MxUJKdtrev9t',
       userId: get('GHL_USER_ID') || '8Uy3ls0B517vLO2tSNva',
       companyId: get('GHL_COMPANY_ID'),
-      envFilePath: skillEnvPath,
+      envFilePath: kcLane ? undefined : skillEnvPath,
     };
 
     // v2 JWT refresh is preferred; fall back to Firebase
@@ -166,7 +189,7 @@ export class WorkflowBuilderClient {
 
     // Legacy Firebase flow
     if (!this.cachedIdToken || Date.now() >= this.tokenExpiry) {
-      await this.refreshFirebaseToken();
+      await this.refreshFirebaseTokenShared();
     }
     return {
       'Authorization': `Bearer ${this.config.apiKey}`,
@@ -215,11 +238,12 @@ export class WorkflowBuilderClient {
   /**
    * Refresh Firebase token and persist the rotated refresh token (legacy).
    */
-  private async refreshFirebaseToken(): Promise<void> {
+  private async refreshFirebaseToken(signal?: AbortSignal): Promise<void> {
     const url = `${WorkflowBuilderClient.FIREBASE_TOKEN_URL}?key=${this.config.firebaseApiKey}`;
 
     const res = await fetch(url, {
       method: 'POST',
+      signal,
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: `grant_type=refresh_token&refresh_token=${encodeURIComponent(this.config.firebaseRefreshToken)}`,
     });
@@ -241,9 +265,132 @@ export class WorkflowBuilderClient {
 
     // Persist rotated refresh token
     if (data.refresh_token && data.refresh_token !== this.config.firebaseRefreshToken) {
-      this.config.firebaseRefreshToken = data.refresh_token;
-      this.persistToken('GHL_FIREBASE_REFRESH_TOKEN', data.refresh_token);
+      if (kcLaneMode()) {
+        // The vault is the source of truth for lanes. Google's securetoken endpoint does not
+        // rotate Firebase refresh tokens in practice; if it ever does, make it loud.
+        process.stderr.write('[KC GHL] WARNING: Firebase returned a rotated refresh token; the vault still holds the previous value\n');
+      } else {
+        this.config.firebaseRefreshToken = data.refresh_token;
+        this.persistToken('GHL_FIREBASE_REFRESH_TOKEN', data.refresh_token);
+      }
     }
+  }
+
+  /**
+   * KC shared token cache: one cached Firebase ID token per login, shared by every lane
+   * process using that login. One refresh at a time (PID lock file); waiters reuse the
+   * result. Retries Google quota (429) with backoff. Bounded by the tool call's deadline.
+   */
+  private async refreshFirebaseTokenShared(): Promise<void> {
+    const deadline = Date.now() + Math.min(KC_AUTH_BUDGET_MS, kcRemainingMs() - 5_000);
+    const dir = process.env.KC_GHL_TOKEN_CACHE_DIR;
+    if (!dir) {
+      // Outside a KC lane: original upstream behavior (no shared cache, legacy TTL fallback).
+      await this.refreshFirebaseTokenWithBackoff(deadline);
+      this.tokenExpiry = (kcJwtExp(this.cachedIdToken) ?? Date.now() + WorkflowBuilderClient.TOKEN_TTL_MS) - 120_000;
+      return;
+    }
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    // Stable identity: the launcher's login name plus the public Firebase web key.
+    // Never derived from the refresh token, so a rotation cannot split the cache.
+    const credential = process.env.KC_GHL_CREDENTIAL || 'unnamed';
+    const id = createHash('sha256').update(`${credential}:${this.config.firebaseApiKey}`).digest('hex').slice(0, 24);
+    const cacheFile = join(dir, `${id}.json`);
+    const lockFile = join(dir, `${id}.lock`);
+    this.kcCacheFile = cacheFile;
+    const margin = 120_000;
+    const useCache = (): boolean => {
+      try {
+        const c = JSON.parse(readFileSync(cacheFile, 'utf8')) as { idToken?: unknown; expiresAt?: unknown };
+        const exp = kcJwtExp(c.idToken);
+        if (exp !== null && c.expiresAt === exp && exp - Date.now() > margin) {
+          this.cachedIdToken = c.idToken as string;
+          this.tokenExpiry = exp - margin;
+          return true;
+        }
+      } catch {
+        // missing or unreadable cache
+      }
+      return false;
+    };
+    if (useCache()) return;
+
+    let fd: number | null = null;
+    while (fd === null) {
+      if (Date.now() > deadline) throw new Error('KC token cache: timed out waiting for another lane to refresh');
+      kcCheckCall('token refresh');
+      try {
+        fd = openSync(lockFile, 'wx', 0o600);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+        kcClaimAbandonedLock(lockFile);
+        await kcSleep(500);
+        if (useCache()) return;
+      }
+    }
+    kcHeldLocks.set(lockFile, fstatSync(fd).ino);
+    try {
+      writeFileSync(fd, String(process.pid));
+      if (useCache()) return;
+      await this.refreshFirebaseTokenWithBackoff(deadline);
+      const expiresAt = this.idTokenExpiry();
+      this.tokenExpiry = expiresAt - margin;
+      const tmp = `${cacheFile}.${process.pid}.tmp`;
+      writeFileSync(tmp, JSON.stringify({ idToken: this.cachedIdToken, expiresAt }), { mode: 0o600 });
+      renameSync(tmp, cacheFile);
+      process.stderr.write('[KC GHL] Firebase token refreshed and shared\n');
+    } finally {
+      closeSync(fd);
+      kcReleaseLock(lockFile);
+    }
+  }
+
+  private async refreshFirebaseTokenWithBackoff(deadline: number): Promise<void> {
+    const waits = [5_000, 10_000, 20_000];
+    for (let attempt = 0; ; attempt++) {
+      kcCheckCall('token refresh');
+      const remaining = deadline - Date.now();
+      if (remaining <= 1_000) throw new Error('KC token cache: auth time budget exhausted');
+      try {
+        await this.refreshFirebaseToken(kcRequestSignal(Math.min(15_000, remaining)));
+        return;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const wait = waits[attempt];
+        if (!msg.includes('(429)') || wait === undefined || Date.now() + wait + 1_000 > deadline) throw err;
+        process.stderr.write(`[KC GHL] Firebase token quota hit; retrying in ${wait / 1000}s\n`);
+        await kcSleep(wait);
+      }
+    }
+  }
+
+  /** Expiry of the current ID token. Throws on a malformed token; no fallback lifetime. */
+  private idTokenExpiry(): number {
+    const exp = kcJwtExp(this.cachedIdToken);
+    if (exp === null) {
+      this.cachedIdToken = null;
+      throw new Error('KC token cache: Firebase returned a malformed ID token');
+    }
+    return exp;
+  }
+
+  /** After GHL rejects a token: forget it here and remove it from the shared cache if still current. */
+  private kcInvalidateToken(rejected: string): void {
+    if (this.cachedIdToken === rejected) {
+      this.cachedIdToken = null;
+      this.tokenExpiry = 0;
+    }
+    const f = this.kcCacheFile;
+    if (!f) return;
+    try {
+      const c = JSON.parse(readFileSync(f, 'utf8')) as { idToken?: unknown };
+      if (c.idToken === rejected) {
+        const tmp = `${f}.${process.pid}.invalidate`;
+        writeFileSync(tmp, '{}', { mode: 0o600 });
+        renameSync(tmp, f);
+        process.stderr.write('[KC GHL] GHL rejected the cached token; cleared it for all lanes on this login\n');
+      }
+    } catch { /* nothing to clear */ }
   }
 
   /**
@@ -276,13 +423,28 @@ export class WorkflowBuilderClient {
     path: string,
     body?: unknown
   ): Promise<{ status: number; data: T }> {
+    // KC lane guard: reject path tricks, then check the URL fetch will actually send.
+    if (/\.\.|\\|%|#/.test(path)) {
+      throw new Error('KC lane guard: blocked a workflow request with an unsafe path');
+    }
+    const url = new URL(`${WorkflowBuilderClient.BASE_URL}${path}`);
+    const pin = kcPinned();
+    if (pin) {
+      const prefix = `/workflow/${pin}`;
+      if (url.pathname !== prefix && !url.pathname.startsWith(`${prefix}/`)) {
+        throw new Error("KC lane guard: blocked a workflow request outside this lane's account");
+      }
+    }
     const headers = await this.getHeaders();
-    const url = `${WorkflowBuilderClient.BASE_URL}${path}`;
+    // Re-check after auth: auth can take time, and a write must not start too late.
+    kcCheckCall(`${method} request`);
+    kcCheckWrite(method);
 
-    const opts: RequestInit = { method, headers };
+    const opts: RequestInit = { method, headers, signal: kcRequestSignal() };
     if (body) opts.body = JSON.stringify(body);
 
     const res = await fetch(url, opts);
+    if (res.status === 401 && headers['token-id']) this.kcInvalidateToken(headers['token-id']);
     const text = await res.text();
 
     let data: T;
@@ -319,6 +481,7 @@ export class WorkflowBuilderClient {
    * Get a workflow with full workflowData (actions, triggers, etc.)
    */
   async getWorkflow(workflowId: string): Promise<WorkflowFull> {
+    kcAssertId('workflow ID', workflowId);
     const { data } = await this.request<WorkflowFull>(
       'GET',
       `/${this.config.locationId}/${workflowId}`
@@ -363,6 +526,7 @@ export class WorkflowBuilderClient {
       deletedSteps?: string[];
     }
   ): Promise<WorkflowFull> {
+    kcAssertId('workflow ID', workflowId);
     // Get current state for version
     const current = await this.getWorkflow(workflowId);
 
@@ -423,6 +587,7 @@ export class WorkflowBuilderClient {
    * Delete a workflow.
    */
   async deleteWorkflow(workflowId: string): Promise<void> {
+    kcAssertId('workflow ID', workflowId);
     await this.request('DELETE', `/${this.config.locationId}/${workflowId}`);
   }
 
