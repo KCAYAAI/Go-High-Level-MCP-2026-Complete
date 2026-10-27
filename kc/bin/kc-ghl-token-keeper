@@ -279,7 +279,8 @@ def logins_from_registry(reg):
 def slack(text):
     """Post an alert. Returns True only when Slack confirms delivery (no channel configured counts as delivered)."""
     if not ALERT_CHANNEL:
-        return True
+        log('alert not sent: no alert channel configured')
+        return False
     try:
         token = vault_get('SCOUT_SLACK_BOT_TOKEN')
     except Transient:
@@ -309,12 +310,16 @@ def main():
     if not a.status:
         # One keeper run at a time (status file, registry alert marker). The lock sits next to the registry
         # so it works even when the registry is invalid.
-        run_lock = open(REGISTRY + '.keeper.lock', 'a')
         try:
+            run_lock = open(REGISTRY + '.keeper.lock', 'a')
             fcntl.flock(run_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             log('another keeper run is in progress; skipping')
             return 0
+        except OSError as e:
+            log(f'cannot take the keeper run lock ({type(e).__name__}); not running unlocked')
+            slack(f':rotating_light: GHL token keeper cannot run: run lock unavailable next to the lane registry ({type(e).__name__}).')
+            return 2
     try:
         reg = read_json(REGISTRY)
         problem = registry_problem(reg)
@@ -361,8 +366,8 @@ def main():
         except Exception as e:  # one login's failure never stops the others or the status write
             failed += 1
             dead = isinstance(e, Dead)
-            if s.get('state') == 'ok':
-                s.pop('alerted', None)                   # healthy -> failed is a new incident (also migrates old status files)
+            if s.get('state') == 'ok' and s.pop('alerted', False):
+                s['recovery_pending'] = True             # old status format: the earlier incident still owes its recovery notice
             s.update(state='dead' if dead else 'retrying', failures=s.get('failures', 0) + 1,
                      last_error=f'{type(e).__name__}: {e}', last_failure=now())
             log(f'{cred} | FAILED ({s["failures"]}) | {s["last_error"]}')

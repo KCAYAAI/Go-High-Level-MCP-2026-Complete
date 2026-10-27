@@ -294,6 +294,26 @@ class KeeperTest(unittest.TestCase):
         self.assertEqual(self.run_keeper(), 2)
         self.assertFalse(os.path.exists(os.environ['KC_GHL_REGISTRY'] + '.keeper-alerted'))
 
+    def test_old_status_owed_recovery_survives_one_transient_failure(self):
+        self.k.vault_set('T_RT', 'S'); self.run_keeper()
+        sf = os.path.join(self.cache, 'keeper-status.json'); st = json.load(open(sf))
+        key = next(k for k in st if k.startswith('owner:')); st[key].update(state='ok', alerted=True, failures=0); json.dump(st, open(sf, 'w'))
+        posts = []; self.k.slack = lambda text: (posts.append(text), True)[1]
+        Firebase.MODE = '429'; self.run_keeper('--force')          # one transient failure, below threshold
+        Firebase.MODE = 'ok'; self.run_keeper('--force')            # healthy
+        self.assertEqual(sum('healthy again' in p for p in posts), 1, posts)
+
+    def test_no_alert_channel_never_counts_as_delivered(self):
+        self.k.ALERT_CHANNEL = ''
+        self.assertFalse(self.k.slack('x'))
+
+    def test_lock_unavailable_alerts_and_does_not_run_unlocked(self):
+        alerts = []; self.k.slack = lambda text: (alerts.append(text), True)[1]
+        self.k.REGISTRY = os.path.join(self.tmp, 'missing-dir', 'lanes.json')
+        n = len(Firebase.CALLS)
+        self.assertEqual(self.run_keeper(), 2)
+        self.assertEqual(len(Firebase.CALLS), n); self.assertTrue(alerts and 'run lock' in alerts[0])
+
     def _cid(self):
         cache = [f for f in self.files('.json') if not f.endswith('keeper-status.json')][0]
         return os.path.basename(cache)[:-5]
