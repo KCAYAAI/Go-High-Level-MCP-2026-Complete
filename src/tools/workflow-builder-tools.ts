@@ -19,7 +19,7 @@ import {
   WorkflowTrigger,
 } from '../clients/workflow-builder-client.js';
 
-import { kcPlanRequests, KcPartialWriteError, kcLaneMode } from '../kc/lane.js';
+import { kcPlanRequests, KcPartialWriteError, kcLaneMode, kcTargetLocation } from '../kc/lane.js';
 
 /** Tool result for a multi-step write that created something and then failed: name it, never hide it. */
 function kcPartialResult(err: KcPartialWriteError, c: WorkflowBuilderClient): ToolResult {
@@ -351,7 +351,7 @@ export class WorkflowBuilderTools {
     }
 
     try {
-      const loc = params.locationId;
+      const loc = params.locationId ?? kcTargetLocation();
       const c = loc === undefined || loc === '' ? this.client : this.client.forLocation(loc as string);
       switch (name) {
         case 'ghl_create_workflow':

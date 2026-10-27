@@ -60,6 +60,26 @@ await t('extra agency paths are a variable (KC_GHL_AGENCY_PATHS)', async () => {
   process.env.KC_GHL_AGENCY_PATHS = '/brand-boards';
   try { await ax.get('/brand-boards/x'); assert.equal(auth(), 'Bearer tok-AGENCY'); } finally { delete process.env.KC_GHL_AGENCY_PATHS; }
 });
+await t('per-call locationId drives upstream config.locationId and the token (tools without a native locationId arg)', async () => {
+  await lane.kcRunToolCall('search_contacts', undefined, async () => {
+    assert.equal(client.getConfig().locationId, A);
+    await ax.get('/contacts/', { params: { locationId: client.getConfig().locationId } });
+  }, A);
+  assert.equal(auth(), 'Bearer tok-A');
+  assert.equal(new URL(ax.getUri(sent.at(-1))).searchParams.get('locationId'), A);
+  assert.equal(client.getConfig().locationId, B, 'outside the call the lane default is back');
+});
+await t('kcSplitLocationArg: strips the arg for tools that do not declare it, keeps it for tools that do, rejects junk', async () => {
+  assert.deepEqual(lane.kcSplitLocationArg({ q: 1, locationId: A }, false), { location: A, args: { q: 1 } });
+  assert.deepEqual(lane.kcSplitLocationArg({ q: 1, locationId: A }, true), { location: A, args: { q: 1, locationId: A } });
+  assert.deepEqual(lane.kcSplitLocationArg({ q: 1 }, false), { args: { q: 1 } });
+  assert.throws(() => lane.kcSplitLocationArg({ locationId: '../x' }, false), /20-character/);
+});
+await t('pinned lane: per-call locationId for another account is refused', async () => {
+  process.env.KC_GHL_PINNED_LOCATION = B;
+  try { assert.throws(() => lane.kcSplitLocationArg({ locationId: A }, false), /KC lane guard/); assert.equal(lane.kcSplitLocationArg({ locationId: B }, false).location, B); }
+  finally { delete process.env.KC_GHL_PINNED_LOCATION; }
+});
 await t('outside a KC lane nothing is routed', async () => {
   delete process.env.KC_GHL_LANE;
   try { await ax.get('/contacts/', { params: { locationId: A } }); assert.equal(auth(), 'Bearer tok-AGENCY'); } finally { process.env.KC_GHL_LANE = 'agency_test'; }

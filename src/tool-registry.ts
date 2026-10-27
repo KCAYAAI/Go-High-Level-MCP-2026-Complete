@@ -64,7 +64,7 @@ import { OAuthTools } from './tools/oauth-tools.js';
 import { OfficialSpecTools } from './tools/official-spec-tools.js';
 import { WorkflowInsightsTools } from './tools/workflow-insights-tools.js';
 import { AgentWorkspaceTools } from './tools/agent-workspace-tools.js';
-import { kcRunToolCall, kcLaneMode } from './kc/lane.js';
+import { kcRunToolCall, kcLaneMode, kcPinned, kcSplitLocationArg, KC_LOCATION_ARG } from './kc/lane.js';
 
 // ─── Types ──────────────────────────────────────────────────
 
@@ -405,9 +405,15 @@ export class ToolRegistry {
       if (!this.isToolVisible(name)) throw new McpError(ErrorCode.InvalidParams, `Unknown tool: ${name}`);
       try {
         // KC lanes only: per-call deadline, caller cancellation, audit line. Outside a lane: upstream path.
-        const result = kcLaneMode()
-          ? await kcRunToolCall(name, extra?.signal, () => this.callTool(name, args ?? {}))
-          : await this.callTool(name, args ?? {});
+        let result;
+        if (kcLaneMode()) {
+          // Agency lane: any tool may name a sub-account; pinned lanes accept only their own.
+          const native = this.kcDeclaresLocationArg(name);
+          const { location, args: callArgs } = kcSplitLocationArg(args ?? {}, native);
+          result = await kcRunToolCall(name, extra?.signal, () => this.callTool(name, callArgs), location);
+        } else {
+          result = await this.callTool(name, args ?? {});
+        }
         return toMcpResult(result);
       } catch (error) {
         if (error instanceof ToolInputError) throw new McpError(ErrorCode.InvalidParams, error.message);
@@ -455,14 +461,28 @@ export class ToolRegistry {
    */
   getAllToolDefinitions(): Tool[] {
     // Add annotations to existing tool defs for the REST endpoint
+    const kcAgency = kcLaneMode() && !kcPinned();
     return this.visibleToolDefs().map(tool => {
       const meta = (tool as any)._meta;
       const annotations = inferAnnotations(tool.name, meta);
+      const props = (tool.inputSchema as { properties?: Record<string, unknown> })?.properties;
+      // KC agency lane: advertise an optional sub-account on every tool that lacks one.
+      const inputSchema = kcAgency && !(props && 'locationId' in props)
+        ? { ...tool.inputSchema, properties: { ...(props || {}), locationId: KC_LOCATION_ARG } }
+        : tool.inputSchema;
       return {
         ...tool,
+        inputSchema,
         annotations,
       };
     });
+  }
+
+  /** True if the tool's own schema declares locationId (it uses the argument itself). */
+  private kcDeclaresLocationArg(name: string): boolean {
+    const def = this.allToolDefs.find(tool => tool.name === name);
+    const props = (def?.inputSchema as { properties?: Record<string, unknown> } | undefined)?.properties;
+    return !!props && 'locationId' in props;
   }
 
   getToolInventory(): ToolInventoryItem[] {

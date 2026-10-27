@@ -33,20 +33,45 @@ export const KC_REQUEST_TIMEOUT_MS = 25_000;
 /** A write is only sent if at least this much call time remains. */
 export const KC_MIN_WRITE_WINDOW_MS = KC_REQUEST_TIMEOUT_MS + 2_000;
 
-interface KcCallState { deadline: number; signal?: AbortSignal; tool: string }
+interface KcCallState { deadline: number; signal?: AbortSignal; tool: string; location?: string }
 const kcCall = new AsyncLocalStorage<KcCallState>();
 
 /** Run one tool call with a deadline, the caller's cancellation signal, and an audit entry. */
-export async function kcRunToolCall<T>(tool: string, signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T> {
+export async function kcRunToolCall<T>(tool: string, signal: AbortSignal | undefined, fn: () => Promise<T>, location?: string): Promise<T> {
   const started = Date.now();
   let ok = false;
   try {
-    const out = await kcCall.run({ deadline: started + KC_CALL_BUDGET_MS, signal, tool }, fn);
+    const out = await kcCall.run({ deadline: started + KC_CALL_BUDGET_MS, signal, tool, location }, fn);
     ok = !(out && typeof out === 'object' && (out as { success?: unknown }).success === false);
     return out;
   } finally {
     kcAudit(tool, ok, Date.now() - started);
   }
+}
+
+/** Agency lane: the sub-account this tool call targets (undefined = the lane default). */
+export function kcTargetLocation(): string | undefined {
+  return kcCall.getStore()?.location;
+}
+
+export const KC_LOCATION_ARG = {
+  type: 'string',
+  description: "Sub-account (location) ID to run this tool in. Optional: defaults to this connection's account. "
+    + 'Only the agency connection accepts other sub-accounts.',
+};
+
+/**
+ * Agency lane: read and validate a per-call locationId. Returns the target and the args to pass on
+ * (stripped of locationId when the tool does not declare it natively).
+ */
+export function kcSplitLocationArg(args: Record<string, unknown>, nativeLocationArg: boolean): { location?: string; args: Record<string, unknown> } {
+  const raw = args.locationId;
+  if (raw === undefined || raw === null || raw === '') return { args };
+  if (typeof raw !== 'string' || !/^[A-Za-z0-9]{20}$/.test(raw)) throw new Error('KC lane guard: locationId must be a 20-character sub-account ID');
+  kcAssertLocationAllowed(raw);
+  if (nativeLocationArg) return { location: raw, args };
+  const { locationId: _drop, ...rest } = args;
+  return { location: raw, args: rest };
 }
 
 /** Milliseconds left in the current tool call (Infinity outside a call). */

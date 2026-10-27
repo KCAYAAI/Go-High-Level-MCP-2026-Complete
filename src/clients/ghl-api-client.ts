@@ -385,7 +385,7 @@ import {
 } from '../types/ghl-types.js';
 import { resolveVersion } from './version-router.js';
 import { resolveRequestVersion } from './endpoint-version-resolver.js';
-import { kcAssertPublicRequest, kcCheckCall, kcCheckWrite, kcRequestSignal, kcLaneMode, kcIsWrite, kcUnknownOutcome, kcAgencyTokenFor } from '../kc/lane.js';
+import { kcAssertPublicRequest, kcCheckCall, kcCheckWrite, kcRequestSignal, kcLaneMode, kcIsWrite, kcUnknownOutcome, kcAgencyTokenFor, kcPinned, kcTargetLocation } from '../kc/lane.js';
 
 /**
  * GoHighLevel API Client
@@ -403,6 +403,17 @@ export class GHLApiClient {
       // boundary so no request can inherit a named-v3 fallback in legacy mode.
       version: resolveVersion([], config.apiGeneration, config.version),
     };
+    if (kcLaneMode() && !kcPinned()) {
+      // KC agency lane: every upstream use of the configured sub-account follows the tool call's
+      // locationId (if given); the request then carries that sub-account's own token.
+      const laneDefault = this.config.locationId;
+      Object.defineProperty(this.config, 'locationId', {
+        get: () => kcTargetLocation() ?? laneDefault,
+        set: () => { /* the lane default is fixed by the launcher */ },
+        enumerable: true,
+        configurable: false,
+      });
+    }
     
     // Create axios instance with base configuration
     this.axiosInstance = axios.create({
