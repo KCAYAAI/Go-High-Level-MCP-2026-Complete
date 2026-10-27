@@ -144,6 +144,17 @@ await t('R6: read-only and agency refusals are reported as KC refusals, not GHL 
   msg = ''; try { await ax.get('/contacts/', { params: { locationIds: [A, B] } }); } catch (e) { msg = e.message; }
   assert.match(msg, /^KC agency lane/);
 });
+await t('R7: catalog-derived read-POSTs are only search/list endpoints (snapshot; additions need review)', () => {
+  const list = lane.kcReadPostTemplatesForReview();
+  const paths = [...new Set(list.map((src) => src.replace(/\\/g, '').replace(/^\^/, '').replace(/\/\?\$$/, '')))].sort();
+  assert.deepEqual(paths, ['/opportunities/search', '/social-media-posting/category/queues/list', '/social-media-posting/category/queues/list/calendar']);
+});
+await t('R7: read-only lane refuses a read-scoped POST that is not a search/list endpoint', async () => {
+  process.env.KC_GHL_READ_ONLY = '1';
+  try { await assert.rejects(ax.post(`/saas/allow-attach-rebilling/${A}`, {}), /read-only lane: POST refused/); }
+  finally { delete process.env.KC_GHL_READ_ONLY; }
+  assert.equal(sent.length, 0);
+});
 await t('R6: without the read-only flag, writes are not refused by the lane', async () => {
   await ax.put('/contacts/abc', {}, { params: { locationId: A } }); assert.equal(sent.length, 1);
 });

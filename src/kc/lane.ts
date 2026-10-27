@@ -227,7 +227,7 @@ function kcLocationPathTemplates(): RegExp[] {
     const p = e?.path;
     if (typeof p !== 'string') continue;
     const scopes = Array.isArray(e.scopes) ? (e.scopes as unknown[]) : [];
-    if (String(e.method).toUpperCase() === 'POST' && scopes.length > 0
+    if (String(e.method).toUpperCase() === 'POST' && scopes.length > 0 && /\/(search|list)(\/calendar)?$/i.test(p)
         && scopes.every((s) => typeof s === 'string' && /\.(readonly|read)$/.test(s))) {
       readPosts.push(kcTemplateRegex(p, false));
     }
@@ -328,13 +328,19 @@ function kcCollectBodyLocations(data: unknown, out: unknown[], depth = 0): void 
 }
 
 /** Search-style POST endpoints the hand-written tools use that are reads but are not in the official catalog. */
-const KC_READ_POST_FALLBACK = /^\/(contacts|objects\/[^/]+\/records|users|custom-fields)\/search\/?$/i;
+const KC_READ_POST_FALLBACK = /^\/(contacts|objects\/[^/]+\/records)\/search\/?$/i;
 
 /**
  * Read-only lanes (registry `read_only: true`, env KC_GHL_READ_ONLY=1): refuse every write before it leaves.
  * Allowed: GET/HEAD/OPTIONS, and POSTs that are reads (catalog scopes all *.readonly / *.read, or a known search path).
  * GHL's token scopes are the second line of defense.
  */
+/** Tests/review: the catalog-derived read-POST templates (search/list endpoints whose scopes are all read scopes). */
+export function kcReadPostTemplatesForReview(): string[] {
+  kcLocationPathTemplates();
+  return kcReadPostTemplates.map((re) => re.source);
+}
+
 export function kcAssertReadOnly(method: string, fullUrl?: string): void {
   if (!kcLaneMode() || process.env.KC_GHL_READ_ONLY !== '1') return;
   const m = (method || 'get').toUpperCase();
