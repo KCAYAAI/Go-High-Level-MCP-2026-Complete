@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""kc-ghl: one launcher for every KC GHL MCP lane.
+
+Usage:
+  kc-ghl --lane <lane> --caller <profile>          start the BusyBee MCP server for that lane
+  kc-ghl --lane <lane> --caller <profile> --check  validate lane, caller, and secrets; start nothing
+  kc-ghl --list                                    show lanes and allowed callers
+
+The lane registry (lanes.json) holds no secrets. Secrets come from the KC vault by
+name at launch and only the lane's own secrets enter the server process.
+--caller is attribution for the audit log, not authentication: every profile runs
+as the same OS user.
+"""
+import argparse, json, os, shutil, subprocess, sys
+
+REGISTRY = os.environ.get('KC_GHL_REGISTRY', '/home/aya/.local/share/kc-ghl/lanes.json')
+WORKDIR = '/home/aya/.local/share/kc-ghl'  # no .env here; the server never reads a stray one
+SECRET_HELPER = '/home/aya/.local/bin/kc-secret'
+
+
+def fail(msg, code=2):
+    sys.stderr.write(f'kc-ghl: {msg}\n')
+    sys.exit(code)
+
+
+def load():
+    try:
+        with open(REGISTRY) as f:
+            return json.load(f)
+    except (OSError, ValueError) as e:
+        fail(f'cannot read lane registry: {type(e).__name__}')
+
+
+def secret(name):
+    # stdin=DEVNULL: never let the helper touch the MCP stdio pipe
+    r = subprocess.run([SECRET_HELPER, 'get', name], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    value = r.stdout.strip()
+    if r.returncode != 0 or not value or '\n' in value:
+        fail(f'vault secret {name} is missing or malformed')
+    return value
+
+
+def main():
+    ap = argparse.ArgumentParser(prog='kc-ghl')
+    ap.add_argument('--lane')
+    ap.add_argument('--caller')
+    ap.add_argument('--check', action='store_true')
+    ap.add_argument('--list', action='store_true')
+    a = ap.parse_args()
+    reg = load()
+    lanes = reg.get('lanes', {})
+
+    if a.list:
+        for name, lane in lanes.items():
+            state = 'PENDING' if lane.get('pending') else 'ready'
+            print(f"{name:20} {state:8} {lane.get('account', '')} | callers: {', '.join(lane.get('callers', []))}")
+        return
+
+    if not a.lane or not a.caller:
+        fail('--lane and --caller are required')
+    lane = lanes.get(a.lane)
+    if lane is None:
+        fail(f'unknown lane {a.lane}')
+    if a.caller not in lane.get('callers', []):
+        fail(f'caller {a.caller} is not approved for lane {a.lane}')
+    if lane.get('pending'):
+        fail(f"lane {a.lane} is not ready: {lane['pending']}")
+
+    env = {k: os.environ[k] for k in ('PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR') if k in os.environ}
+    env.update(reg.get('common_env', {}))
+    env.update({
+        'GHL_LOCATION_ID': lane['location_id'],
+        'GHL_USER_ID': lane['user_id'],
+        'GHL_COMPANY_ID': lane['company_id'],
+        'KC_GHL_LANE': a.lane,
+        'KC_GHL_CALLER': a.caller,
+        'KC_GHL_AUDIT_LOG': reg['audit_log'],
+        'KC_GHL_TOKEN_CACHE_DIR': reg['token_cache_dir'],
+        # Stable shared-cache identity: who owns the login and which vault key holds it.
+        'KC_GHL_CREDENTIAL': f"{lane['credential_owner']}:{lane['secrets'].get('GHL_FIREBASE_REFRESH_TOKEN', 'none')}",
+    })
+    # Location lanes are pinned; an agency lane sets pinned: false and may target any sub-account.
+    if lane.get('pinned', True):
+        env['KC_GHL_PINNED_LOCATION'] = lane['location_id']
+    for env_name, vault_name in lane['secrets'].items():
+        env[env_name] = secret(vault_name)
+
+    node = shutil.which('node', path=env.get('PATH'))
+    if not node:
+        fail('node is not on PATH')
+    if not os.path.isfile(reg['server']):
+        fail('BusyBee server build is missing')
+
+    if a.check:
+        print(f"ok | lane {a.lane} | caller {a.caller} | account {lane['account']} | {len(lane['secrets'])} secrets loaded")
+        return
+    os.chdir(WORKDIR)
+    os.execve(node, [node, reg['server']], env)
+
+
+if __name__ == '__main__':
+    main()

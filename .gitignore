@@ -52,3 +52,10 @@ pids/
 tmp/
 temp/ 
 .vercel
+
+# KC lanes: the real lane registry holds account/user IDs and stays on the host
+# (~/.local/share/kc-ghl/lanes.json, or KC_GHL_REGISTRY). Secrets live only in the KC vault.
+kc/lanes.json
+kc/lanes.*.json
+!kc/lanes.example.json
+kc/review/
